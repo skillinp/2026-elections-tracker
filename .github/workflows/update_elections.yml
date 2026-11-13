@@ -1,0 +1,25 @@
+name: Update California Election Results
+
+on:
+  schedule:
+    # Runs at :20 and :50 past the hour (great for catching 4:15 PM / 5:00 PM county drops)
+    - cron: '20,50 * * * *'
+  workflow_dispatch: # Lets you click "Run workflow" manually anytime
+
+jobs:
+  scrape-and-push:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./2026-elections
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests beautifulsoup4 pdfplumber
+      - name: Fetch results and push to Google Sheets
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: python main.py
