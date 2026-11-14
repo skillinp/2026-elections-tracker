@@ -2,7 +2,7 @@ import os
 import re
 import io
 import requests
-import pandas as pd
+import csv
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -140,14 +140,15 @@ def fetch_livevoterturnout(index_url: str):
         csv_link = f"{base}/{csv_link.lstrip('./')}"
 
     csv_text = requests.get(csv_link, headers=HEADERS, timeout=20).text
-    df = pd.read_csv(io.StringIO(csv_text))
+    reader = csv.DictReader(io.StringIO(csv_text))
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for _, r in df.iterrows():
+    for r in reader:
+        vals = list(r.values())
         rows.append([
-            str(r.get("Contest Name", r.iloc[0])),
-            str(r.get("Candidate Name", r.iloc[1])),
-            int(r.get("Total Votes", r.iloc[2])),
-            str(r.get("Percentage", "")),
+            r.get("Contest Name", vals[0] if len(vals) > 0 else ""),
+            r.get("Candidate Name", vals[1] if len(vals) > 1 else ""),
+            int(str(r.get("Total Votes", vals[2] if len(vals) > 2 else 0)).replace(",", "")),
+            r.get("Percentage", ""),
             NOW,
         ])
     return rows
