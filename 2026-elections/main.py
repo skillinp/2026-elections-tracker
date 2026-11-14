@@ -1,8 +1,8 @@
 import os
 import re
 import io
-import requests
 import csv
+import requests
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -17,7 +17,6 @@ HEADERS = {
 }
 
 def strip_ns(tag: str) -> str:
-    """Removes '{RcvDetailedReport}' XML namespace prefixes."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 def fetch_santa_barbara():
@@ -29,7 +28,6 @@ def fetch_santa_barbara():
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
     current_contest = ""
 
-    # Only inspect leaf <tr> elements (skip giant outer layout wrapper rows)
     for tr in soup.find_all("tr"):
         if tr.find("table"):
             continue
@@ -38,12 +36,10 @@ def fetch_santa_barbara():
         if not cells:
             continue
 
-        # Contest headers look like: "Governor (Vote for 1)" or "Mayor, City of Santa Barbara (Vote for 1)"
         if len(cells) == 1 and "(Vote for" in cells[0]:
             current_contest = cells[0]
             continue
 
-        # Candidate rows have 5 columns: [Candidate, Poll, Mail, Total, Pct]
         if current_contest and len(cells) >= 5 and cells[0] not in ("Candidate", "Times Cast"):
             cand = cells[0]
             total_votes = cells[3].replace(",", "")
@@ -58,39 +54,27 @@ def fetch_alameda_rcv(xml_url: str):
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
 
-    # Extract race title from Tablix2 Textbox24
     contest_title = "Alameda RCV"
     for elem in root.iter():
         if strip_ns(elem.tag) == "Tablix2" and "Textbox24" in elem.attrib:
             contest_title = elem.attrib["Textbox24"]
             break
 
-    rows = [["Contest", "Round", "Candidate", "Votes", "Status", "Source URL"]]
+    rows = [["Contest", "Round", "Candidate", "Votes", "Pct", "Source URL"]]
     current_round = ""
 
     for elem in root.iter():
         tag = strip_ns(elem.tag)
         if tag == "Tablix5" and "Textbox86" in elem.attrib:
-            current_round = elem.attrib["Textbox86"]  # e.g., "Round 1"
+            current_round = elem.attrib["Textbox86"]
         elif tag == "choiceGroup" and current_round:
-            # Print one sample choiceGroup structure on first pass to verify exact attributes
-            if len(rows) == 1:
-                print("Sample choiceGroup children:", [(strip_ns(c.tag), c.attrib) for c in elem.iter()])
-            cand_name = ""
-            votes = ""
-            status = ""
-            for child in elem.iter():
-                for k, v in child.attrib.items():
-                    if any(w in k.lower() for w in ["choice", "candidate", "name", "textbox26", "textbox28"]):
-                        if not cand_name and not v.replace(".", "").isdigit():
-                            cand_name = v
-                    if any(w in k.lower() for w in ["vote", "count", "points"]) and "nontransferable" not in k.lower():
-                        if not votes and v.replace(".", "").isdigit():
-                            votes = round(float(v))
-                    if "status" in k.lower() or "state" in k.lower():
-                        status = v
+            cand_name = elem.attrib.get("choiceName2", "")
+            raw_votes = elem.attrib.get("votes", "0")
+            raw_pct = elem.attrib.get("Textbox17", "")
+            votes = round(float(raw_votes)) if raw_votes.replace(".", "").isdigit() else 0
+            pct = f"{float(raw_pct) * 100:.2f}%" if raw_pct.replace(".", "").isdigit() else ""
             if cand_name:
-                rows.append([contest_title, current_round, cand_name, votes, status, xml_url])
+                rows.append([contest_title, current_round, cand_name, votes, pct, xml_url])
 
     return rows
 
@@ -98,62 +82,76 @@ def fetch_la():
     url = "https://results.lavote.gov/ElectionResults/GetElectionData?electionID=4348"
     resp = requests.get(url, headers={**HEADERS, "Referer": "https://results.lavote.gov/"}, timeout=20)
     resp.raise_for_status()
-    payload = resp.json()
-    inner = payload.get("Data", {})
+    inner = resp.json().get("Data", {})
 
-    if isinstance(inner, dict):
-        print("LA Data keys:", list(inner.keys()))
+    # Build lookup map if candidates are stored in CandidateList keyed by ID or ContestID
+    cand_list = inner.get("CandidateList", [])
+    if cand_list:
+        print("LA sample CandidateList[0]:", cand_list[0])
+
+    groups = inner.get("ContestGroups", [])
+    if groups and groups[0].get("Contests"):
+        print("LA sample Contest[0]:", groups[0]["Contests"][0])
+
+    # Group candidates by ContestID if CandidateList is flat
+    cands_by_contest = {}
+    for c in cand_list:
+        cid = c.get("ContestID") or c.get("ContestId")
+        if cid is not None:
+            cands_by_contest.setdefault(cid, []).append(c)
+
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-
-    # Walk inner dict/lists to locate contest objects
-    contests = []
-    if isinstance(inner, dict):
-        for v in inner.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                contests = v
-                print("LA sample contest keys:", list(v[0].keys()))
-                break
-
-    for c in contests:
-        c_title = c.get("ContestTitle") or c.get("Title") or c.get("Name") or ""
-        cands = c.get("Candidates") or c.get("CandidateResults") or c.get("Choices") or []
-        for cand in cands:
-            rows.append([
-                c_title,
-                cand.get("CandidateName") or cand.get("Name") or cand.get("Title") or "",
-                cand.get("TotalVotes") or cand.get("Votes") or 0,
-                cand.get("VotePercent") or cand.get("Percent") or "",
-                NOW,
-            ])
+    for grp in groups:
+        for contest in grp.get("Contests", []):
+            cid = contest.get("ID") or contest.get("Id") or contest.get("ContestID")
+            c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
+            cands = contest.get("Candidates") or cands_by_contest.get(cid, [])
+            for cand in cands:
+                rows.append([
+                    c_title,
+                    cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
+                    cand.get("Votes") or cand.get("TotalVotes") or 0,
+                    cand.get("Percent") or cand.get("VotePercent") or cand.get("Percentage") or "",
+                    NOW,
+                ])
     return rows
 
-def fetch_livevoterturnout(index_url: str):
-    resp = requests.get(index_url, headers=HEADERS, timeout=20)
+def fetch_alameda_main():
+    url = "https://www.alamedacountyca.gov/rovresults/260/"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    csv_link = next(
-        a["href"] for a in soup.find_all("a", href=True)
-        if "csv" in a.get_text().lower() and "contest" in a.get_text().lower()
-    )
-    if not csv_link.startswith("http"):
-        base = index_url.rsplit("/", 1)[0]
-        csv_link = f"{base}/{csv_link.lstrip('./')}"
 
-    csv_text = requests.get(csv_link, headers=HEADERS, timeout=20).text
-    reader = csv.DictReader(io.StringIO(csv_text))
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for r in reader:
-        vals = list(r.values())
-        rows.append([
-            r.get("Contest Name", vals[0] if len(vals) > 0 else ""),
-            r.get("Candidate Name", vals[1] if len(vals) > 1 else ""),
-            int(str(r.get("Total Votes", vals[2] if len(vals) > 2 else 0)).replace(",", "")),
-            r.get("Percentage", ""),
-            NOW,
-        ])
+    current_contest = ""
+    for tr in soup.find_all("tr"):
+        if tr.find("table"):
+            continue
+        cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        if len(cells) == 1 and len(cells[0]) > 4 and not cells[0].replace(",", "").isdigit():
+            current_contest = cells[0]
+        elif current_contest and len(cells) >= 3:
+            # Look for candidate name followed by integer vote total and percentage
+            nums = [c for c in cells[1:] if c.replace(",", "").isdigit()]
+            pcts = [c for c in cells[1:] if "%" in c]
+            if nums:
+                rows.append([current_contest, cells[0], int(nums[-1].replace(",", "")), pcts[-1] if pcts else "", NOW])
     return rows
 
+def debug_livevoterturnout():
+    url = "https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links = [a["href"] for a in soup.find_all("a", href=True)]
+    scripts = [s["src"] for s in soup.find_all("script", src=True)]
+    print("livevoterturnout links:", links[:15])
+    print("livevoterturnout scripts:", scripts[:10])
+
 if __name__ == "__main__":
+    debug_livevoterturnout()
     tabs = {}
 
     sources = {
@@ -162,10 +160,7 @@ if __name__ == "__main__":
             "https://www.alamedacountyca.gov/rovresults/rcv/260/Oakland/008-SchoolDirector_District_6/RcvDetailedReport.xml"
         ),
         "RAW_LA": fetch_la,
-        "RAW_SanDiego": lambda: fetch_livevoterturnout("https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html"),
-        "RAW_Riverside": lambda: fetch_livevoterturnout("https://www.livevoterturnout.com/ENR/riversidecaenr/12/en/Index_12.html"),
-        "RAW_SanBernardino": lambda: fetch_livevoterturnout("https://www.livevoterturnout.com/ENR/sanbernardinocaenr/3/en/Index_3.html"),
-        "RAW_Imperial": lambda: fetch_livevoterturnout("https://www.livevoterturnout.com/ENR/imperialcaenr/6/en/Index_6.html"),
+        "RAW_Alameda": fetch_alameda_main,
     }
 
     for tab_name, fetcher in sources.items():
