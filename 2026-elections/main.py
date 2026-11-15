@@ -79,7 +79,7 @@ def fetch_alameda_rcv(xml_url: str):
 
     return rows
 
-# 3. WORKING: Alameda Main
+# 3. EXPANDED: Alameda Main (captures ALL panels, including measures and local races)
 def fetch_alameda_main():
     url = "https://www.alamedacountyca.gov/rovresults/260/"
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -87,14 +87,11 @@ def fetch_alameda_main():
     soup = BeautifulSoup(resp.text, "html.parser")
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for btn in soup.select("button[data-target]"):
-        h3 = btn.find("h3", class_="racePanelHeading")
-        target_id = btn.get("data-target", "").lstrip("#")
-        if not h3 or not target_id:
-            continue
-        contest = h3.get_text(" ", strip=True)
-        panel = soup.find(id=target_id)
-        if not panel:
+    for panel in soup.select("div.panelDtl"):
+        # Find the button or heading immediately preceding this panelDtl
+        trigger = panel.find_previous(["button", "h3", "h4"])
+        contest = re.sub(r"\s+", " ", trigger.get_text(" ", strip=True)) if trigger else ""
+        if not contest:
             continue
 
         for tr in panel.find_all("tr"):
@@ -103,7 +100,7 @@ def fetch_alameda_main():
             if len(cells) >= 2:
                 nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
                 pcts = [c for c in cells[1:] if "%" in c]
-                if nums and cells[0].lower() not in ("candidate", "total", "total votes", "registered voters", "ballots cast"):
+                if nums and cells[0].lower() not in ("candidate", "total", "total votes", "registered voters", "ballots cast", "undervotes", "overvotes"):
                     rows.append([contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
     return rows
 
@@ -132,49 +129,38 @@ def fetch_sacramento_web(page):
                         rows.append([txt, cells[0], party, int(nums[-1]), pcts[-1] if pcts else "", NOW])
     return rows
 
-# 5. FIXING: Los Angeles via Playwright network capture
-def fetch_la_browser(page):
-    captured_json = []
+# 5. FIXED: Los Angeles (fetches GetElectionData + GetCounterData?electionID=4348)
+def fetch_la():
+    base = "https://results.lavote.gov/ElectionResults"
+    hdrs = {**HEADERS, "Referer": "https://results.lavote.gov/"}
 
-    def handle_response(resp):
-        if "lavote.gov" in resp.url and resp.status == 200:
-            ct = resp.headers.get("content-type", "")
-            if "json" in ct or "Get" in resp.url:
-                try:
-                    captured_json.append((resp.url, resp.json()))
-                except Exception:
-                    pass
+    meta = requests.get(f"{base}/GetElectionData?electionID=4348", headers=hdrs, timeout=20).json().get("Data", {})
+    counter_raw = requests.get(f"{base}/GetCounterData?electionID=4348", headers=hdrs, timeout=20).json()
+    counter_data = counter_raw.get("Data", counter_raw)
+    print("LA GetCounterData sample:", str(counter_data)[:350])
 
-    page.on("response", handle_response)
-    page.goto("https://results.lavote.gov/#year=2026&election=4348", wait_until="networkidle", timeout=35000)
-    page.wait_for_timeout(3000)
-    page.remove_listener("response", handle_response)
-
-    print("LA captured endpoints:", [u for u, _ in captured_json])
-
-    meta = {}
+    # Index all candidate tallies in GetCounterData by candidate ID
     live_votes = {}
-    for u, data in captured_json:
-        inner = data.get("Data", data) if isinstance(data, dict) else data
-        if isinstance(inner, dict) and "ContestGroups" in inner:
-            meta = inner
-        # Recursively harvest any dict with candidate ID + non-zero vote count
-        def walk(obj):
-            if isinstance(obj, dict):
-                cid = obj.get("ID") or obj.get("CandidateID") or obj.get("CandID")
-                votes = next((obj[k] for k in ["Votes", "TotalVotes", "VoteCount", "Count"] if isinstance(obj.get(k), (int, float))), None)
-                if cid is not None and votes is not None:
-                    if cid not in live_votes or votes > live_votes[cid]["votes"]:
-                        live_votes[cid] = {
-                            "votes": int(votes),
-                            "pct": obj.get("Percent") or obj.get("Percentage") or obj.get("VotePercent") or ""
-                        }
-                for v in obj.values():
-                    walk(v)
-            elif isinstance(obj, list):
-                for item in obj:
-                    walk(item)
-        walk(inner)
+    def walk(obj):
+        if isinstance(obj, dict):
+            cid = obj.get("ID") or obj.get("CandidateID") or obj.get("CandID") or obj.get("Id")
+            # Grab any integer vote field (excluding ID/Order fields)
+            vote_val = next(
+                (obj[k] for k in ["Votes", "TotalVotes", "VoteCount", "CandidateVotes", "Count", "Ballots"]
+                 if isinstance(obj.get(k), (int, float))),
+                None
+            )
+            if cid is not None and vote_val is not None:
+                live_votes[cid] = {
+                    "votes": int(vote_val),
+                    "pct": obj.get("Percent") or obj.get("Percentage") or obj.get("VotePercent") or ""
+                }
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+    walk(counter_data)
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
     for grp in meta.get("ContestGroups") or []:
@@ -202,22 +188,19 @@ def fetch_la_browser(page):
                 rows.append([c_title, name, votes, pct, NOW])
     return rows
 
-# 6. FIXING: San Francisco (index.html table structure)
-def fetch_sf():
-    url = "https://www.sfelections.org/results/20261103w/index.html"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+# 6. FIXED: San Francisco via Playwright
+def fetch_sf_browser(page):
+    page.goto("https://www.sfelections.org/results/20261103w/index.html", wait_until="networkidle", timeout=30000)
+    page.wait_for_timeout(2500)
+    soup = BeautifulSoup(page.content(), "html.parser")
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
     for table in soup.find_all("table"):
-        # SF puts contest title in the first <th> with colspan or <caption>
-        first_th = table.find("th", colspan=True)
-        caption = table.find("caption")
-        contest = (caption.get_text(" ", strip=True) if caption else (first_th.get_text(" ", strip=True) if first_th else ""))
+        first_th = table.find("th")
+        prev_h = table.find_previous(["h2", "h3", "h4", "caption"])
+        contest = (first_th.get_text(" ", strip=True) if first_th and first_th.get("colspan") else (prev_h.get_text(" ", strip=True) if prev_h else ""))
         if not contest:
             continue
-
         for tr in table.find_all("tr"):
             cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
             cells = [c for c in cells if c]
@@ -231,26 +214,34 @@ def fetch_sf():
                     rows.append([contest, cand, int(nums[0]), pcts[0] if pcts else "", NOW])
 
     if len(rows) == 1:
-        print("SF debug snippet:", re.sub(r"\s+", " ", soup.get_text())[:400])
+        print("SF rendered body sample:", re.sub(r"\s+", " ", soup.body.get_text())[:400] if soup.body else "No body")
     return rows
 
-# 7. FIXING: livevoterturnout.com (San Diego, Riverside, San Bernardino, Imperial)
-def fetch_livevoterturnout(page, slug: str, election_id: str):
-    url = f"https://www.livevoterturnout.com/ENR/{slug}/{election_id}/en/Index_{election_id}.html"
-    page.goto(url, wait_until="networkidle", timeout=30000)
+# 7. FIXED: livevoterturnout.com (auto-resolves live election URL & expands all contests)
+def fetch_livevoterturnout(page, slug: str):
+    # Visiting /ENR/<slug>/ redirects to the active election ID automatically
+    page.goto(f"https://www.livevoterturnout.com/ENR/{slug}/", wait_until="networkidle", timeout=30000)
     page.wait_for_timeout(3000)
-    soup = BeautifulSoup(page.content(), "html.parser")
+    print(f"livevoterturnout [{slug}] resolved URL:", page.url)
 
+    # Click "All Contests" or expand buttons if present so all races render
+    for selector in ["text=All Contests", "text=Show All", "button:has-text('All')"]:
+        try:
+            if page.locator(selector).count() > 0:
+                page.locator(selector).first.click(timeout=2000)
+                page.wait_for_timeout(1500)
+                break
+        except Exception:
+            pass
+
+    soup = BeautifulSoup(page.content(), "html.parser")
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    # Each table on livevoterturnout has a preceding .panel-heading or button/header
+
     for tbl in soup.find_all("table"):
-        heading = tbl.find_previous(["h2", "h3", "h4", "button", "a"])
-        # Walk up to panel/card wrapper if available
-        wrapper = tbl.find_parent(class_=re.compile(r"panel|card|contest", re.I))
-        if wrapper:
-            hdr = wrapper.find(class_=re.compile(r"heading|title|header", re.I))
-            if hdr:
-                heading = hdr
+        wrapper = tbl.find_parent(class_=re.compile(r"panel|card|contest|box", re.I))
+        heading = wrapper.find(class_=re.compile(r"heading|title|header", re.I)) if wrapper else None
+        if not heading:
+            heading = tbl.find_previous(["h2", "h3", "h4", "button", "a"])
         contest = re.sub(r"\s+", " ", heading.get_text(" ", strip=True)) if heading else ""
         if not contest or len(contest) > 150:
             continue
@@ -264,8 +255,6 @@ def fetch_livevoterturnout(page, slug: str, election_id: str):
                 if nums:
                     rows.append([contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
 
-    if len(rows) == 1 and slug == "sandiegocaenr":
-        print("SD debug text:", re.sub(r"\s+", " ", soup.get_text())[:400])
     return rows
 
 if __name__ == "__main__":
@@ -277,7 +266,7 @@ if __name__ == "__main__":
             "https://www.alamedacountyca.gov/rovresults/rcv/260/Oakland/008-SchoolDirector_District_6/RcvDetailedReport.xml"
         ),
         "RAW_Alameda": fetch_alameda_main,
-        "RAW_SF": fetch_sf,
+        "RAW_LA": fetch_la,
     }
 
     for tab_name, fetcher in static_sources.items():
@@ -294,11 +283,11 @@ if __name__ == "__main__":
 
         browser_sources = {
             "RAW_Sacramento": lambda: fetch_sacramento_web(page),
-            "RAW_LA": lambda: fetch_la_browser(page),
-            "RAW_SanDiego": lambda: fetch_livevoterturnout(page, "sandiegocaenr", "25"),
-            "RAW_Riverside": lambda: fetch_livevoterturnout(page, "riversidecaenr", "25"),
-            "RAW_SanBernardino": lambda: fetch_livevoterturnout(page, "sanbernardinocaenr", "25"),
-            "RAW_Imperial": lambda: fetch_livevoterturnout(page, "imperialcaenr", "25"),
+            "RAW_SF": lambda: fetch_sf_browser(page),
+            "RAW_SanDiego": lambda: fetch_livevoterturnout(page, "sandiegocaenr"),
+            "RAW_Riverside": lambda: fetch_livevoterturnout(page, "riversidecaenr"),
+            "RAW_SanBernardino": lambda: fetch_livevoterturnout(page, "sanbernardinocaenr"),
+            "RAW_Imperial": lambda: fetch_livevoterturnout(page, "imperialcaenr"),
         }
 
         for tab_name, fetcher in browser_sources.items():
