@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -128,7 +129,7 @@ def fetch_sacramento_web(page):
                         rows.append([txt, cells[0], party, int(nums[-1]), pcts[-1] if pcts else "", NOW])
     return rows
 
-# 5. FIXED: Los Angeles (maps ReferenceID + Value from GetCounterData)
+# 5. WORKING: Los Angeles
 def fetch_la():
     base = "https://results.lavote.gov/ElectionResults"
     hdrs = {**HEADERS, "Referer": "https://results.lavote.gov/"}
@@ -137,7 +138,6 @@ def fetch_la():
     counter_raw = requests.get(f"{base}/GetCounterData?electionID=4348", headers=hdrs, timeout=20).json()
     counters = counter_raw.get("Data", counter_raw)
 
-    # Build lookup: ReferenceID -> Value for all candidate counters
     cand_votes = {}
     if isinstance(counters, list):
         for item in counters:
@@ -170,13 +170,49 @@ def fetch_la():
                 rows.append([c_title, name, votes, pct, NOW])
     return rows
 
-# 6. NEW: Butte County via Clarity JSON (no scrolling needed)
-def fetch_clarity_json(county_slug: str, election_id: str, version_id: str):
-    base = f"https://results.enr.clarityelections.com/CA/{county_slug}/{election_id}/{version_id}/json"
-    settings = requests.get(f"{base}/en/electionsettings.json", headers=HEADERS, timeout=20).json()
-    summary = requests.get(f"{base}/sum.json", headers=HEADERS, timeout=20).json()
+# 6. NEW: San Francisco (detail.html via requests)
+def fetch_sf():
+    url = "https://www.sfelections.org/results/20261103w/detail.html"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Map contest ID -> {title, candidates: [names]}
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    for table in soup.find_all("table"):
+        # Look for contest header in previous heading or table header
+        prev_h = table.find_previous(["h2", "h3", "h4", "caption"])
+        first_th = table.find("th", colspan=True)
+        contest = (first_th.get_text(" ", strip=True) if first_th else (prev_h.get_text(" ", strip=True) if prev_h else ""))
+        contest = re.sub(r"\s+", " ", contest)
+        if not contest:
+            continue
+
+        for tr in table.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if len(cells) >= 3 and cells[0] != contest:
+                cand = cells[0]
+                if cand.lower() in ("candidate", "choice", "total", "total votes", "undervotes", "overvotes", "registered voters", "ballots cast", "precincts reporting"):
+                    continue
+                nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                pcts = [c for c in cells[1:] if "%" in c]
+                if nums:
+                    # On SF detail.html, total votes is the last integer column before or after pct
+                    rows.append([contest, cand, int(nums[-1]), pcts[-1] if pcts else "", NOW])
+
+    if len(rows) == 1:
+        print("SF detail.html snippet:", re.sub(r"\s+", " ", soup.get_text())[:400])
+    return rows
+
+# 7. NEW: Clarity Elections (auto-resolves current_ver.txt + ALL.json)
+def fetch_clarity_json(county_slug: str, election_id: str):
+    root_url = f"https://results.enr.clarityelections.com/CA/{county_slug}/{election_id}"
+    ver = requests.get(f"{root_url}/current_ver.txt", headers=HEADERS, timeout=20).text.strip()
+    base = f"{root_url}/{ver}/json"
+
+    settings = requests.get(f"{base}/en/electionsettings.json", headers=HEADERS, timeout=20).json()
+    all_data = requests.get(f"{base}/ALL.json", headers=HEADERS, timeout=20).json()
+
     contest_meta = {}
     for c in settings.get("Contests", []):
         cid = str(c.get("K") or c.get("Id") or c.get("id") or "")
@@ -186,7 +222,7 @@ def fetch_clarity_json(county_slug: str, election_id: str, version_id: str):
             contest_meta[cid] = {"title": title, "cands": cands}
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for item in summary.get("Contests", []):
+    for item in all_data.get("Contests", []):
         cid = str(item.get("K") or item.get("Id") or item.get("id") or "")
         meta = contest_meta.get(cid, {})
         title = meta.get("title") or item.get("C") or f"Contest {cid}"
@@ -201,24 +237,57 @@ def fetch_clarity_json(county_slug: str, election_id: str, version_id: str):
             rows.append([title, cand_name, votes, pct, NOW])
 
     if len(rows) == 1:
-        print(f"Clarity [{county_slug}] sample keys:", list(summary.keys()), str(summary)[:300])
+        print(f"Clarity [{county_slug}] ver={ver} keys:", list(all_data.keys()), str(all_data)[:300])
     return rows
 
-# 7. INSPECTING SF & livevoterturnout XHRs
-def inspect_sf_and_lvt(page):
-    # Check SF via requests (since requests bypassed CloudFront 403 earlier)
-    sf_resp = requests.get("https://www.sfelections.org/results/20261103w/index.html", headers=HEADERS, timeout=20)
-    sf_soup = BeautifulSoup(sf_resp.text, "html.parser")
-    scripts = [s.get("src") for s in sf_soup.find_all("script") if s.get("src")]
-    links = [a.get("href") for a in sf_soup.find_all("a", href=True) if "detail" in a.get("href", "") or "summary" in a.get("href", "") or "xml" in a.get("href", "") or "json" in a.get("href", "")]
-    print("SF scripts/links:", scripts[:8], links[:8])
+# 8. NEW: livevoterturnout.com multi-page static HTML crawler (no Playwright needed!)
+def fetch_lvt_multipage(index_url: str):
+    resp = requests.get(index_url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Check San Diego livevoterturnout XHRs on working Index_25.html
-    sd_xhrs = []
-    page.on("response", lambda r: sd_xhrs.append(r.url) if "livevoterturnout" in r.url and not r.url.endswith((".js", ".css", ".png", ".woff2")) else None)
-    page.goto("https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html", wait_until="networkidle", timeout=30000)
-    page.wait_for_timeout(2000)
-    print("SD livevoterturnout data URLs:", sd_xhrs)
+    # Collect all category HTML pages linked on Index_XX.html
+    page_urls = [index_url]
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.endswith(".html") and not href.startswith("http") and "Summary" not in href:
+            full_url = urljoin(index_url, href)
+            if full_url not in page_urls:
+                page_urls.append(full_url)
+
+    print(f"LVT crawling {len(page_urls)} sub-pages:", [u.split("/")[-1] for u in page_urls])
+
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    seen = set()
+
+    for page_url in page_urls:
+        p_resp = requests.get(page_url, headers=HEADERS, timeout=20)
+        if p_resp.status_code != 200:
+            continue
+        p_soup = BeautifulSoup(p_resp.text, "html.parser")
+
+        for tbl in p_soup.find_all("table"):
+            wrapper = tbl.find_parent(class_=re.compile(r"panel|card|contest|box", re.I))
+            heading = wrapper.find(class_=re.compile(r"heading|title|header", re.I)) if wrapper else None
+            if not heading:
+                heading = tbl.find_previous(["h2", "h3", "h4", "button", "a"])
+            contest = re.sub(r"\s+", " ", heading.get_text(" ", strip=True)) if heading else ""
+            if not contest or len(contest) > 150:
+                continue
+
+            for tr in tbl.find_all("tr"):
+                cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+                cells = [c for c in cells if c]
+                if len(cells) >= 3 and cells[0].lower() not in ("candidate", "choice", "total", "total votes", "times cast", "undervotes", "overvotes"):
+                    nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                    pcts = [c for c in cells[1:] if "%" in c]
+                    if nums:
+                        key = (contest, cells[0])
+                        if key not in seen:
+                            seen.add(key)
+                            rows.append([contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
+
+    return rows
 
 if __name__ == "__main__":
     tabs = {}
@@ -230,7 +299,11 @@ if __name__ == "__main__":
         ),
         "RAW_Alameda": fetch_alameda_main,
         "RAW_LA": fetch_la,
-        "RAW_Butte": lambda: fetch_clarity_json("Butte", "126778", "387043"),
+        "RAW_SF": fetch_sf,
+        "RAW_Butte": lambda: fetch_clarity_json("Butte", "126778"),
+        "RAW_SanDiego": lambda: fetch_lvt_multipage(
+            "https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html"
+        ),
     }
 
     for tab_name, fetcher in static_sources.items():
@@ -251,11 +324,6 @@ if __name__ == "__main__":
             print(f"[OK] RAW_Sacramento: fetched {len(rows) - 1} rows")
         except Exception as e:
             print(f"[ERROR] RAW_Sacramento failed: {e}")
-
-        try:
-            inspect_sf_and_lvt(page)
-        except Exception as e:
-            print(f"[ERROR] inspect failed: {e}")
 
         browser.close()
 
