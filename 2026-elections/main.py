@@ -1,11 +1,10 @@
 import os
 import re
-import io
 import requests
-import pdfplumber
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
 WEBHOOK_URL = os.environ["APPS_SCRIPT_URL"]
 SECRET_TOKEN = os.environ["WEBHOOK_SECRET"]
@@ -80,150 +79,200 @@ def fetch_alameda_rcv(xml_url: str):
 
     return rows
 
-# 3. FIXING VOTES/PCT: Los Angeles
+# 3. FIXED: Los Angeles (merges GetElectionData metadata with live vote totals endpoint)
 def fetch_la():
-    url = "https://results.lavote.gov/ElectionResults/GetElectionData?electionID=4348"
-    resp = requests.get(url, headers={**HEADERS, "Referer": "https://results.lavote.gov/"}, timeout=20)
-    resp.raise_for_status()
-    inner = resp.json().get("Data", {})
+    base = "https://results.lavote.gov/ElectionResults"
+    hdrs = {**HEADERS, "Referer": "https://results.lavote.gov/"}
 
-    groups = inner.get("ContestGroups") or []
-    printed_sample = False
+    meta = requests.get(f"{base}/GetElectionData?electionID=4348", headers=hdrs, timeout=20).json().get("Data", {})
+
+    # Fetch live tallies from LA's results endpoint
+    live_votes = {}
+    for ep in ["GetElectionResults?electionID=4348", "GetResults?electionID=4348", "GetLiveResults?electionID=4348"]:
+        r = requests.get(f"{base}/{ep}", headers=hdrs, timeout=20)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            print(f"LA live endpoint hit: {ep} -> {r.text[:250]}")
+            res_json = r.json()
+            # Recursively index any dict that has an 'ID' and 'Votes'
+            def walk(obj):
+                if isinstance(obj, dict):
+                    if "ID" in obj and "Votes" in obj:
+                        live_votes[obj["ID"]] = obj
+                    for v in obj.values():
+                        walk(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        walk(item)
+            walk(res_json)
+            if live_votes:
+                break
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for grp in groups:
+    for grp in meta.get("ContestGroups") or []:
         if not isinstance(grp, dict):
             continue
-        contests = grp.get("Contests") or []
-        if isinstance(contests, dict):
-            contests = list(contests.values())
-        for contest in contests:
+        for contest in grp.get("Contests") or []:
             if not isinstance(contest, dict):
                 continue
-            c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
+            c_title = contest.get("Title") or contest.get("Name") or ""
             cands = contest.get("Candidates") or []
+            # Calculate total contest votes so we can compute percentage cleanly
+            resolved = []
             for cand in cands:
                 if not isinstance(cand, dict):
                     continue
-                if not printed_sample:
-                    print("LA sample candidate dict:", cand)
-                    printed_sample = True
-                # Check all common LA JSON keys for votes and percent
-                votes = next(
-                    (cand[k] for k in ["Votes", "TotalVotes", "VoteCount", "BallotCount", "Count", "YesVotes"] if k in cand and cand[k] is not None),
-                    0
-                )
-                pct = next(
-                    (cand[k] for k in ["Percent", "VotePercent", "Percentage", "VotePercentage", "Pct"] if k in cand and cand[k] is not None),
-                    ""
-                )
-                rows.append([
-                    c_title,
-                    cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
-                    votes,
-                    pct,
-                    NOW,
-                ])
+                cid = cand.get("ID")
+                tally = live_votes.get(cid, cand)
+                votes = tally.get("Votes") or 0
+                resolved.append((cand.get("Name") or "", int(votes), tally.get("Percent") or tally.get("Percentage") or ""))
+
+            total_contest_votes = sum(v for _, v, _ in resolved)
+            for name, votes, pct in resolved:
+                if not pct and total_contest_votes > 0:
+                    pct = f"{(votes / total_contest_votes) * 100:.2f}%"
+                rows.append([c_title, name, votes, pct, NOW])
     return rows
 
-# 4. NEW: San Francisco (Static HTML summary tables)
-def fetch_sf():
-    url = "https://www.sfelections.org/results/20261103w/index.html"
+# 4. NEW: Alameda Main (parses <h3 class="racePanelHeading"> + <div class="panelDtl">)
+def fetch_alameda_main():
+    url = "https://www.alamedacountyca.gov/rovresults/260/"
     resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for table in soup.find_all("table"):
-        # SF tables typically put the contest title in a preceding heading or <caption>/<th>
-        caption = table.find("caption")
-        prev_h = table.find_previous(["h2", "h3", "h4"])
-        contest = (caption.get_text(" ", strip=True) if caption else (prev_h.get_text(" ", strip=True) if prev_h else ""))
-        for tr in table.find_all("tr"):
+    for btn in soup.select("button[data-target]"):
+        h3 = btn.find("h3", class_="racePanelHeading")
+        target_id = btn.get("data-target", "").lstrip("#")
+        if not h3 or not target_id:
+            continue
+        contest = h3.get_text(" ", strip=True)
+        panel = soup.find(id=target_id)
+        if not panel:
+            continue
+
+        # Each candidate row inside panelDtl has candidate name, vote count, and percentage
+        for tr in panel.find_all("tr"):
             cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
-            if len(cells) >= 3 and any(c.replace(",", "").isdigit() for c in cells[1:]):
-                cand = cells[0]
-                if cand.lower() in ("candidate", "total", "total votes", "undervotes", "overvotes"):
-                    continue
+            cells = [c for c in cells if c]
+            if len(cells) >= 2:
                 nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
                 pcts = [c for c in cells[1:] if "%" in c]
-                if nums and contest:
-                    rows.append([contest, cand, int(nums[0]), pcts[0] if pcts else "", NOW])
+                if nums and cells[0].lower() not in ("candidate", "total", "total votes", "registered voters", "ballots cast"):
+                    rows.append([contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
     return rows
 
-# 5. NEW: Sacramento (Auto-finds newest PDF on the official schedule page and parses it)
-def fetch_sacramento():
-    sched_url = "https://elections.saccounty.gov/us/en/election-information/november-3--2026--general-election-results-schedule.html"
-    resp = requests.get(sched_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+# 5. NEW: Sacramento Web (https://eresults.saccounty.net/)
+def fetch_sacramento_web(page):
+    page.goto("https://eresults.saccounty.net/", wait_until="networkidle", timeout=30000)
+    soup = BeautifulSoup(page.content(), "html.parser")
 
-    pdf_links = [
-        a["href"] for a in soup.find_all("a", href=True)
-        if a["href"].lower().endswith(".pdf") and "november-2026" in a["href"].lower()
-    ]
-    if not pdf_links:
-        return [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    rows = [["Contest", "Candidate", "Party", "Votes", "Pct", "Updated"]]
+    # Find each contest header containing "(Vote for" or Measure header, then read its candidate table
+    for header in soup.find_all(["h2", "h3", "h4", "th", "td", "div", "span"]):
+        txt = re.sub(r"\s+", " ", header.get_text(" ", strip=True))
+        if "(Vote for" in txt and len(txt) < 150:
+            # Find the candidate table following this header (skip the Times Cast / Undervotes summary table)
+            tbl = header.find_next("table")
+            while tbl and "Candidate" not in tbl.get_text():
+                tbl = tbl.find_next("table")
+            if not tbl:
+                continue
+            for tr in tbl.find_all("tr"):
+                cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+                cells = [c for c in cells if c]
+                # Expected columns: [Candidate, Party, Total, Pct] or [Candidate, Total, Pct]
+                if len(cells) >= 3 and cells[0] not in ("Candidate", "Total Votes", "Times Cast", "Undervotes", "Overvotes"):
+                    nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                    pcts = [c for c in cells[1:] if "%" in c]
+                    party = cells[1] if len(cells) >= 4 and not cells[1].replace(",", "").isdigit() else ""
+                    if nums:
+                        rows.append([txt, cells[0], party, int(nums[-1]), pcts[-1] if pcts else "", NOW])
+    return rows
 
-    # Pick the newest dated PDF (e.g. 11132026.pdf > 11102026.pdf)
-    latest_pdf = sorted(set(pdf_links))[-1]
-    if not latest_pdf.startswith("http"):
-        latest_pdf = f"https://elections.saccounty.gov{latest_pdf}"
-    print("Sacramento latest PDF:", latest_pdf)
+# 6. NEW: San Francisco + livevoterturnout (San Diego, Riverside, San Bernardino, Imperial)
+def fetch_livevoterturnout(page, slug: str, election_id: str):
+    url = f"https://www.livevoterturnout.com/ENR/{slug}/{election_id}/en/Index_{election_id}.html"
+    page.goto(url, wait_until="networkidle", timeout=30000)
+    page.wait_for_timeout(2500)
+    soup = BeautifulSoup(page.content(), "html.parser")
 
-    pdf_bytes = requests.get(latest_pdf, headers=HEADERS, timeout=30).content
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    for card in soup.select(".panel, .card, .contest-container, table"):
+        heading = card.find(["h2", "h3", "h4", ".panel-title", ".contest-title"])
+        contest = heading.get_text(" ", strip=True) if heading else ""
+        if not contest:
+            continue
+        for tr in card.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if len(cells) >= 3 and cells[0].lower() not in ("candidate", "choice", "total", "total votes"):
+                nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                pcts = [c for c in cells[1:] if "%" in c]
+                if nums:
+                    rows.append([contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
+    return rows
+
+def fetch_sf_web(page):
+    page.goto("https://www.sfelections.org/results/20261103w/detail.html", wait_until="networkidle", timeout=30000)
+    soup = BeautifulSoup(page.content(), "html.parser")
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
     current_contest = ""
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                line = line.strip()
-                if "(Vote for" in line or "MEASURE " in line.upper():
-                    current_contest = line
-                    continue
-                # Match lines ending with vote count and percentage: e.g. "JANE DOE 123,456 54.32%"
-                m = re.match(r"^(.+?)\s+([\d,]+)\s+([\d.]+%)$", line)
-                if m and current_contest:
-                    cand, votes_str, pct = m.groups()
-                    if cand.lower() not in ("total", "times cast", "undervotes", "overvotes"):
-                        rows.append([current_contest, cand.strip(), int(votes_str.replace(",", "")), pct, NOW])
+    for elem in soup.find_all(["h2", "h3", "tr"]):
+        if elem.name in ("h2", "h3"):
+            current_contest = elem.get_text(" ", strip=True)
+        elif elem.name == "tr" and current_contest:
+            cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in elem.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if len(cells) >= 3 and cells[0].lower() not in ("candidate", "total", "total votes", "undervotes", "overvotes"):
+                nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                pcts = [c for c in cells[1:] if "%" in c]
+                if nums:
+                    rows.append([current_contest, cells[0], int(nums[-1]), pcts[-1] if pcts else "", NOW])
     return rows
 
-# 6. QUICK INSPECT: Alameda Main HTML + livevoterturnout JS endpoint
-def inspect_remaining():
-    ala = requests.get("https://www.alamedacountyca.gov/rovresults/260/", headers=HEADERS, timeout=20).text
-    # Find where a major race like "Governor" appears in Alameda's HTML so we see its exact tags
-    idx = ala.find("Governor")
-    if idx != -1:
-        print("Alameda HTML around Governor:", re.sub(r"\s+", " ", ala[max(0, idx-200):idx+400]))
-
-    js_text = requests.get("https://www.livevoterturnout.com/shared/scripts/LiveResultsScripts_v4.2.js", headers=HEADERS, timeout=20).text
-    ajax_calls = re.findall(r'(?:url|getJSON|ajax)\s*[:(]\s*([^,\n\r)]{5,120})', js_text)
-    print("livevoterturnout AJAX calls:", ajax_calls[:15])
-
 if __name__ == "__main__":
-    inspect_remaining()
     tabs = {}
 
-    sources = {
+    static_sources = {
         "RAW_SantaBarbara": fetch_santa_barbara,
         "RCV_Alameda": lambda: fetch_alameda_rcv(
             "https://www.alamedacountyca.gov/rovresults/rcv/260/Oakland/008-SchoolDirector_District_6/RcvDetailedReport.xml"
         ),
         "RAW_LA": fetch_la,
-        "RAW_SF": fetch_sf,
-        "RAW_Sacramento": fetch_sacramento,
+        "RAW_Alameda": fetch_alameda_main,
     }
 
-    for tab_name, fetcher in sources.items():
+    for tab_name, fetcher in static_sources.items():
         try:
             rows = fetcher()
             tabs[tab_name] = rows
             print(f"[OK] {tab_name}: fetched {len(rows) - 1} rows")
         except Exception as e:
             print(f"[ERROR] {tab_name} failed: {e}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        browser_sources = {
+            "RAW_Sacramento": lambda: fetch_sacramento_web(page),
+            "RAW_SF": lambda: fetch_sf_web(page),
+            "RAW_SanDiego": lambda: fetch_livevoterturnout(page, "sandiegocaenr", "25"),
+            "RAW_Riverside": lambda: fetch_livevoterturnout(page, "riversidecaenr", "25"),
+            "RAW_SanBernardino": lambda: fetch_livevoterturnout(page, "sanbernardinocaenr", "25"),
+            "RAW_Imperial": lambda: fetch_livevoterturnout(page, "imperialcaenr", "25"),
+        }
+
+        for tab_name, fetcher in browser_sources.items():
+            try:
+                rows = fetcher()
+                tabs[tab_name] = rows
+                print(f"[OK] {tab_name}: fetched {len(rows) - 1} rows")
+            except Exception as e:
+                print(f"[ERROR] {tab_name} failed: {e}")
+
+        browser.close()
 
     if tabs:
         res = requests.post(
