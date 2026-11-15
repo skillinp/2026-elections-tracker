@@ -1,8 +1,8 @@
 import os
 import re
 import io
-import csv
 import requests
+import pdfplumber
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -80,90 +80,131 @@ def fetch_alameda_rcv(xml_url: str):
 
     return rows
 
-# 3. FIXING: Los Angeles (safe inspection + extraction)
+# 3. FIXING VOTES/PCT: Los Angeles
 def fetch_la():
     url = "https://results.lavote.gov/ElectionResults/GetElectionData?electionID=4348"
     resp = requests.get(url, headers={**HEADERS, "Referer": "https://results.lavote.gov/"}, timeout=20)
     resp.raise_for_status()
     inner = resp.json().get("Data", {})
 
-    cand_list = inner.get("CandidateList") or []
     groups = inner.get("ContestGroups") or []
-
-    if isinstance(cand_list, list) and cand_list:
-        print("LA CandidateList[0]:", cand_list[0])
-    elif isinstance(cand_list, dict) and cand_list:
-        first_k = next(iter(cand_list))
-        print("LA CandidateList dict sample:", first_k, cand_list[first_k])
-
-    if isinstance(groups, list) and groups:
-        print("LA ContestGroups[0]:", str(groups[0])[:300])
-
-    # Build candidate lookup by ContestID if CandidateList is a list of dicts
-    cands_by_contest = {}
-    if isinstance(cand_list, list):
-        for c in cand_list:
-            if isinstance(c, dict):
-                cid = c.get("ContestID") or c.get("ContestId") or c.get("CID")
-                if cid is not None:
-                    cands_by_contest.setdefault(cid, []).append(c)
+    printed_sample = False
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    if isinstance(groups, list):
-        for grp in groups:
-            if not isinstance(grp, dict):
+    for grp in groups:
+        if not isinstance(grp, dict):
+            continue
+        contests = grp.get("Contests") or []
+        if isinstance(contests, dict):
+            contests = list(contests.values())
+        for contest in contests:
+            if not isinstance(contest, dict):
                 continue
-            contests = grp.get("Contests") or []
-            if isinstance(contests, dict):
-                contests = list(contests.values())
-            for contest in contests:
-                if not isinstance(contest, dict):
+            c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
+            cands = contest.get("Candidates") or []
+            for cand in cands:
+                if not isinstance(cand, dict):
                     continue
-                cid = contest.get("ID") or contest.get("Id") or contest.get("ContestID")
-                c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
-                cands = contest.get("Candidates") or cands_by_contest.get(cid, [])
-                for cand in cands:
-                    if not isinstance(cand, dict):
-                        continue
-                    rows.append([
-                        c_title,
-                        cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
-                        cand.get("Votes") or cand.get("TotalVotes") or 0,
-                        cand.get("Percent") or cand.get("VotePercent") or cand.get("Percentage") or "",
-                        NOW,
-                    ])
+                if not printed_sample:
+                    print("LA sample candidate dict:", cand)
+                    printed_sample = True
+                # Check all common LA JSON keys for votes and percent
+                votes = next(
+                    (cand[k] for k in ["Votes", "TotalVotes", "VoteCount", "BallotCount", "Count", "YesVotes"] if k in cand and cand[k] is not None),
+                    0
+                )
+                pct = next(
+                    (cand[k] for k in ["Percent", "VotePercent", "Percentage", "VotePercentage", "Pct"] if k in cand and cand[k] is not None),
+                    ""
+                )
+                rows.append([
+                    c_title,
+                    cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
+                    votes,
+                    pct,
+                    NOW,
+                ])
     return rows
 
-# 4. DISCOVERY: Inspect Alameda Main, livevoterturnout JS endpoints, SF, and OC
-def discover_remaining_counties():
-    # A. Alameda Main HTML structure
-    ala = requests.get("https://www.alamedacountyca.gov/rovresults/260/", headers=HEADERS, timeout=20)
-    soup_ala = BeautifulSoup(ala.text, "html.parser")
-    print("Alameda main links:", [a["href"] for a in soup_ala.find_all("a", href=True)][:15])
-    print("Alameda main text sample:", re.sub(r"\s+", " ", soup_ala.get_text())[:300])
+# 4. NEW: San Francisco (Static HTML summary tables)
+def fetch_sf():
+    url = "https://www.sfelections.org/results/20261103w/index.html"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # B. Find exact JSON endpoint inside livevoterturnout's LiveResultsScripts_v4.2.js
-    js_url = "https://www.livevoterturnout.com/shared/scripts/LiveResultsScripts_v4.2.js"
-    js_text = requests.get(js_url, headers=HEADERS, timeout=20).text
-    json_paths = set(re.findall(r'["\']([^"\']*\.(?:json|csv|xml)[^"\']*)["\']', js_text, re.I))
-    print("livevoterturnout JS data paths:", list(json_paths)[:20])
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    for table in soup.find_all("table"):
+        # SF tables typically put the contest title in a preceding heading or <caption>/<th>
+        caption = table.find("caption")
+        prev_h = table.find_previous(["h2", "h3", "h4"])
+        contest = (caption.get_text(" ", strip=True) if caption else (prev_h.get_text(" ", strip=True) if prev_h else ""))
+        for tr in table.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+            if len(cells) >= 3 and any(c.replace(",", "").isdigit() for c in cells[1:]):
+                cand = cells[0]
+                if cand.lower() in ("candidate", "total", "total votes", "undervotes", "overvotes"):
+                    continue
+                nums = [c.replace(",", "") for c in cells[1:] if c.replace(",", "").isdigit()]
+                pcts = [c for c in cells[1:] if "%" in c]
+                if nums and contest:
+                    rows.append([contest, cand, int(nums[0]), pcts[0] if pcts else "", NOW])
+    return rows
 
-    # C. San Francisco links (XML/CSV/Summary)
-    sf = requests.get("https://www.sfelections.org/results/20261103w/index.html", headers=HEADERS, timeout=20)
-    soup_sf = BeautifulSoup(sf.text, "html.parser")
-    print("SF links:", [a["href"] for a in soup_sf.find_all("a", href=True)][:20])
+# 5. NEW: Sacramento (Auto-finds newest PDF on the official schedule page and parses it)
+def fetch_sacramento():
+    sched_url = "https://elections.saccounty.gov/us/en/election-information/november-3--2026--general-election-results-schedule.html"
+    resp = requests.get(sched_url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # D. Orange County links/scripts
-    oc = requests.get("https://ocvote.gov/results/current-election-results", headers=HEADERS, timeout=20)
-    soup_oc = BeautifulSoup(oc.text, "html.parser")
-    oc_data_links = [
-        a["href"] for a in soup_oc.find_all("a", href=True)
-        if any(ext in a["href"].lower() for ext in [".csv", ".xml", ".json", ".txt", ".pdf", "result"])
+    pdf_links = [
+        a["href"] for a in soup.find_all("a", href=True)
+        if a["href"].lower().endswith(".pdf") and "november-2026" in a["href"].lower()
     ]
-    print("OC data links:", oc_data_links[:15])
+    if not pdf_links:
+        return [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+
+    # Pick the newest dated PDF (e.g. 11132026.pdf > 11102026.pdf)
+    latest_pdf = sorted(set(pdf_links))[-1]
+    if not latest_pdf.startswith("http"):
+        latest_pdf = f"https://elections.saccounty.gov{latest_pdf}"
+    print("Sacramento latest PDF:", latest_pdf)
+
+    pdf_bytes = requests.get(latest_pdf, headers=HEADERS, timeout=30).content
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
+    current_contest = ""
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if "(Vote for" in line or "MEASURE " in line.upper():
+                    current_contest = line
+                    continue
+                # Match lines ending with vote count and percentage: e.g. "JANE DOE 123,456 54.32%"
+                m = re.match(r"^(.+?)\s+([\d,]+)\s+([\d.]+%)$", line)
+                if m and current_contest:
+                    cand, votes_str, pct = m.groups()
+                    if cand.lower() not in ("total", "times cast", "undervotes", "overvotes"):
+                        rows.append([current_contest, cand.strip(), int(votes_str.replace(",", "")), pct, NOW])
+    return rows
+
+# 6. QUICK INSPECT: Alameda Main HTML + livevoterturnout JS endpoint
+def inspect_remaining():
+    ala = requests.get("https://www.alamedacountyca.gov/rovresults/260/", headers=HEADERS, timeout=20).text
+    # Find where a major race like "Governor" appears in Alameda's HTML so we see its exact tags
+    idx = ala.find("Governor")
+    if idx != -1:
+        print("Alameda HTML around Governor:", re.sub(r"\s+", " ", ala[max(0, idx-200):idx+400]))
+
+    js_text = requests.get("https://www.livevoterturnout.com/shared/scripts/LiveResultsScripts_v4.2.js", headers=HEADERS, timeout=20).text
+    ajax_calls = re.findall(r'(?:url|getJSON|ajax)\s*[:(]\s*([^,\n\r)]{5,120})', js_text)
+    print("livevoterturnout AJAX calls:", ajax_calls[:15])
 
 if __name__ == "__main__":
-    discover_remaining_counties()
+    inspect_remaining()
     tabs = {}
 
     sources = {
@@ -172,6 +213,8 @@ if __name__ == "__main__":
             "https://www.alamedacountyca.gov/rovresults/rcv/260/Oakland/008-SchoolDirector_District_6/RcvDetailedReport.xml"
         ),
         "RAW_LA": fetch_la,
+        "RAW_SF": fetch_sf,
+        "RAW_Sacramento": fetch_sacramento,
     }
 
     for tab_name, fetcher in sources.items():
