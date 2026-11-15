@@ -19,6 +19,7 @@ HEADERS = {
 def strip_ns(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
+# 1. WORKING: Santa Barbara
 def fetch_santa_barbara():
     url = "https://www.sbcvote.com/Elections/results/2026nov03/results-1.htm"
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -49,6 +50,7 @@ def fetch_santa_barbara():
 
     return rows
 
+# 2. WORKING: Alameda RCV
 def fetch_alameda_rcv(xml_url: str):
     resp = requests.get(xml_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
@@ -78,80 +80,90 @@ def fetch_alameda_rcv(xml_url: str):
 
     return rows
 
+# 3. FIXING: Los Angeles (safe inspection + extraction)
 def fetch_la():
     url = "https://results.lavote.gov/ElectionResults/GetElectionData?electionID=4348"
     resp = requests.get(url, headers={**HEADERS, "Referer": "https://results.lavote.gov/"}, timeout=20)
     resp.raise_for_status()
     inner = resp.json().get("Data", {})
 
-    # Build lookup map if candidates are stored in CandidateList keyed by ID or ContestID
-    cand_list = inner.get("CandidateList", [])
-    if cand_list:
-        print("LA sample CandidateList[0]:", cand_list[0])
+    cand_list = inner.get("CandidateList") or []
+    groups = inner.get("ContestGroups") or []
 
-    groups = inner.get("ContestGroups", [])
-    if groups and groups[0].get("Contests"):
-        print("LA sample Contest[0]:", groups[0]["Contests"][0])
+    if isinstance(cand_list, list) and cand_list:
+        print("LA CandidateList[0]:", cand_list[0])
+    elif isinstance(cand_list, dict) and cand_list:
+        first_k = next(iter(cand_list))
+        print("LA CandidateList dict sample:", first_k, cand_list[first_k])
 
-    # Group candidates by ContestID if CandidateList is flat
+    if isinstance(groups, list) and groups:
+        print("LA ContestGroups[0]:", str(groups[0])[:300])
+
+    # Build candidate lookup by ContestID if CandidateList is a list of dicts
     cands_by_contest = {}
-    for c in cand_list:
-        cid = c.get("ContestID") or c.get("ContestId")
-        if cid is not None:
-            cands_by_contest.setdefault(cid, []).append(c)
+    if isinstance(cand_list, list):
+        for c in cand_list:
+            if isinstance(c, dict):
+                cid = c.get("ContestID") or c.get("ContestId") or c.get("CID")
+                if cid is not None:
+                    cands_by_contest.setdefault(cid, []).append(c)
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    for grp in groups:
-        for contest in grp.get("Contests", []):
-            cid = contest.get("ID") or contest.get("Id") or contest.get("ContestID")
-            c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
-            cands = contest.get("Candidates") or cands_by_contest.get(cid, [])
-            for cand in cands:
-                rows.append([
-                    c_title,
-                    cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
-                    cand.get("Votes") or cand.get("TotalVotes") or 0,
-                    cand.get("Percent") or cand.get("VotePercent") or cand.get("Percentage") or "",
-                    NOW,
-                ])
+    if isinstance(groups, list):
+        for grp in groups:
+            if not isinstance(grp, dict):
+                continue
+            contests = grp.get("Contests") or []
+            if isinstance(contests, dict):
+                contests = list(contests.values())
+            for contest in contests:
+                if not isinstance(contest, dict):
+                    continue
+                cid = contest.get("ID") or contest.get("Id") or contest.get("ContestID")
+                c_title = contest.get("Name") or contest.get("Title") or contest.get("ContestTitle") or ""
+                cands = contest.get("Candidates") or cands_by_contest.get(cid, [])
+                for cand in cands:
+                    if not isinstance(cand, dict):
+                        continue
+                    rows.append([
+                        c_title,
+                        cand.get("Name") or cand.get("CandidateName") or cand.get("Title") or "",
+                        cand.get("Votes") or cand.get("TotalVotes") or 0,
+                        cand.get("Percent") or cand.get("VotePercent") or cand.get("Percentage") or "",
+                        NOW,
+                    ])
     return rows
 
-def fetch_alameda_main():
-    url = "https://www.alamedacountyca.gov/rovresults/260/"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+# 4. DISCOVERY: Inspect Alameda Main, livevoterturnout JS endpoints, SF, and OC
+def discover_remaining_counties():
+    # A. Alameda Main HTML structure
+    ala = requests.get("https://www.alamedacountyca.gov/rovresults/260/", headers=HEADERS, timeout=20)
+    soup_ala = BeautifulSoup(ala.text, "html.parser")
+    print("Alameda main links:", [a["href"] for a in soup_ala.find_all("a", href=True)][:15])
+    print("Alameda main text sample:", re.sub(r"\s+", " ", soup_ala.get_text())[:300])
 
-    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated"]]
-    current_contest = ""
-    for tr in soup.find_all("tr"):
-        if tr.find("table"):
-            continue
-        cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
-        cells = [c for c in cells if c]
-        if not cells:
-            continue
-        if len(cells) == 1 and len(cells[0]) > 4 and not cells[0].replace(",", "").isdigit():
-            current_contest = cells[0]
-        elif current_contest and len(cells) >= 3:
-            # Look for candidate name followed by integer vote total and percentage
-            nums = [c for c in cells[1:] if c.replace(",", "").isdigit()]
-            pcts = [c for c in cells[1:] if "%" in c]
-            if nums:
-                rows.append([current_contest, cells[0], int(nums[-1].replace(",", "")), pcts[-1] if pcts else "", NOW])
-    return rows
+    # B. Find exact JSON endpoint inside livevoterturnout's LiveResultsScripts_v4.2.js
+    js_url = "https://www.livevoterturnout.com/shared/scripts/LiveResultsScripts_v4.2.js"
+    js_text = requests.get(js_url, headers=HEADERS, timeout=20).text
+    json_paths = set(re.findall(r'["\']([^"\']*\.(?:json|csv|xml)[^"\']*)["\']', js_text, re.I))
+    print("livevoterturnout JS data paths:", list(json_paths)[:20])
 
-def debug_livevoterturnout():
-    url = "https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    links = [a["href"] for a in soup.find_all("a", href=True)]
-    scripts = [s["src"] for s in soup.find_all("script", src=True)]
-    print("livevoterturnout links:", links[:15])
-    print("livevoterturnout scripts:", scripts[:10])
+    # C. San Francisco links (XML/CSV/Summary)
+    sf = requests.get("https://www.sfelections.org/results/20261103w/index.html", headers=HEADERS, timeout=20)
+    soup_sf = BeautifulSoup(sf.text, "html.parser")
+    print("SF links:", [a["href"] for a in soup_sf.find_all("a", href=True)][:20])
+
+    # D. Orange County links/scripts
+    oc = requests.get("https://ocvote.gov/results/current-election-results", headers=HEADERS, timeout=20)
+    soup_oc = BeautifulSoup(oc.text, "html.parser")
+    oc_data_links = [
+        a["href"] for a in soup_oc.find_all("a", href=True)
+        if any(ext in a["href"].lower() for ext in [".csv", ".xml", ".json", ".txt", ".pdf", "result"])
+    ]
+    print("OC data links:", oc_data_links[:15])
 
 if __name__ == "__main__":
-    debug_livevoterturnout()
+    discover_remaining_counties()
     tabs = {}
 
     sources = {
@@ -160,7 +172,6 @@ if __name__ == "__main__":
             "https://www.alamedacountyca.gov/rovresults/rcv/260/Oakland/008-SchoolDirector_District_6/RcvDetailedReport.xml"
         ),
         "RAW_LA": fetch_la,
-        "RAW_Alameda": fetch_alameda_main,
     }
 
     for tab_name, fetcher in sources.items():
