@@ -1,17 +1,52 @@
 """
-2026 California election results -> Google Sheets (through your Apps Script webhook).
+California election results  ->  Google Sheets            (written for the Nov. 3, 2026 general election)
+=====================================================================================================
 
-Run by .github/workflows/update_elections.yml every 30 minutes.
+HOW THE PIECES FIT TOGETHER
+---------------------------
+    GitHub Action (.github/workflows/update_elections.yml, every 30 minutes, or "Run workflow" by hand)
+        |
+        v
+    main.py  (this file)
+        1. downloads results from each county / the Secretary of State  -> one list of rows per tab
+        2. throws away any source that failed or came back empty (that tab keeps its LAST GOOD data)
+        3. POSTs every good tab, plus a STATUS tab, to the Google Apps Script webhook
+        |
+        v
+    Apps Script "Election Results Webhook" (Code.gs)
+        4. writes each tab into the spreadsheet (creating it if it is new)
+        5. rebuilds the RESULTS tab: one tidy table of every RAW_* / RCV_* tab
+        |
+        v
+    The ALL tab looks candidates up in RESULTS (by contest key + candidate name), never by cell address.
 
-WHERE TO ADD THINGS (all three are one-line edits in the CONFIG block below)
-  * another ranked-choice (RCV) tab ............ add a line to RCV_ALAMEDA
-  * another Clarity county (like Butte) ........ add a line to CLARITY_SOURCES
-  * another livevoterturnout.com county ........ add a line to LVT_CLEAN_SOURCES
-The Apps Script creates the tab automatically the first time it receives it.
+TAB NAMING:  RAW_<place>  = what the county published (one row per candidate/choice)
+             RCV_<race>   = round-by-round ranked-choice results for one race
+             RESULTS      = built by Apps Script from all of the above (do not edit by hand)
+             STATUS       = written by this file: OK / EMPTY / ERROR for every source, every run
 
-SAFETY NET: if a source fails (or parses to zero rows) its tab is simply NOT overwritten,
-so you keep the last good data, and the reason is written to the STATUS tab.
+WHERE TO ADD THINGS  (each is a one-line edit in the CONFIG block below)
+    another ranked-choice (RCV) tab ............. RCV_ALAMEDA
+    another Clarity county (like Butte) ......... CLARITY_SOURCES
+    another livevoterturnout.com county ......... LVT_CLEAN_SOURCES  (HTML pages)  or  LVT_XML_SOURCES (XML feed)
+
+NEXT-ELECTION CHECKLIST  (e.g. the 2028 primary) - what is tied to the 2026 general election
+    1. CONFIG block: ALAMEDA_ELECTION, RCV_ALAMEDA, CLARITY_SOURCES ids, LVT_* urls, SF_RESULTS_URL.
+    2. A few older fetchers still have the election hard-coded INSIDE them. Search this file for:
+           "2026nov03"        fetch_santa_barbara   (Santa Barbara results page)
+           "electionID=4348"  fetch_la              (LA County election id - appears twice)
+           "/rovresults/260/" fetch_alameda_main    (Alameda election number)
+           "sandiegocaenr/25" main()                (San Diego livevoterturnout id)
+           "eresults.saccounty.net"  fetch_sacramento_web (same address every election; confirm it shows the new one)
+    3. SOS_FILES: the offices on the ballot change by year. Compare with the list at
+       https://media.sos.ca.gov/media/json-endpoints.csv (it names every statewide feed for the current election).
+    4. Look at the STATUS tab after the first run - any ERROR / EMPTY row tells you which source to fix.
+
+WHY THE "previous data kept" BEHAVIOR MATTERS
+    Counties go down, change layouts, or block bots, usually on election night. A failed source must never blank
+    out good data, so failures are skipped (and reported in STATUS) instead of being written as empty tabs.
 """
+import base64
 import gzip
 import io
 import json
@@ -28,30 +63,33 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
+# The Apps Script web-app URL and the shared secret come from GitHub "Actions secrets" (see the workflow file).
 WEBHOOK_URL = os.environ["APPS_SCRIPT_URL"]
 SECRET_TOKEN = os.environ["WEBHOOK_SECRET"]
 
-# NOTE: GitHub runners use UTC, so this "Updated" stamp is UTC (unchanged from your version).
+# NOTE: GitHub runners use UTC, so this "Updated" stamp is UTC (unchanged from your original version).
 # To stamp Pacific time instead, use:  datetime.now(ZoneInfo("America/Los_Angeles")).strftime(...)
 NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
-NOW_PT = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")  # used on STATUS tab
+NOW_PT = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")  # used on the STATUS tab
 
+# A normal-looking browser identity. Some county sites refuse the default python-requests identity.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/html, application/xml, text/plain, */*",
 }
 
 # =====================================================================================
-# CONFIG - the parts you will edit during the election
+# CONFIG - the parts you will edit during an election
 # =====================================================================================
 
-# Ranked-choice races in Alameda County (Oakland / Berkeley / Albany).
+# --- Ranked-choice races in Alameda County (Oakland / Berkeley / Albany) ---------------------------------
 #   key   = the Google Sheet tab name
-#   value = the race code: the text after "race=" in the county's "RCV tabulations" link
-#           (https://www.alamedacountyca.gov/rovresults/260/), with %2F turned into "/"
-ALAMEDA_ELECTION = 260  # the "260" in .../rovresults/260/
+#   value = the race code: the text after "race=" in the county's "RCV tabulations" link on
+#           https://www.alamedacountyca.gov/rovresults/260/   (with %2F turned back into "/")
+# Every run also logs the races Alameda lists that are NOT in this dict yet, so you can see what else exists.
+ALAMEDA_ELECTION = 260  # the "260" in .../rovresults/260/  (changes every election)
 RCV_ALAMEDA = {
-    "RCV_Alameda":          "Oakland/008-SchoolDirector_District_6",   # your existing tab
+    "RCV_Alameda":          "Oakland/008-SchoolDirector_District_6",   # the original tab (Oakland School Board D6)
     "RCV_Oakland_D2":       "Oakland/002-CityCouncil_District_2",
     "RCV_Berkeley_D7":      "Berkeley/003-CityCouncil_District_7",
     "RCV_Albany_Council":   "Albany/001-CityCouncil",
@@ -69,25 +107,37 @@ RCV_ALAMEDA = {
     # "RCV_Albany_Schools":     "Albany/002-BoardOfEducation",
 }
 
-# Counties on Clarity Elections (results.enr.clarityelections.com/CA/<County>/<id>/).
-#   tab name -> (County path segment exactly as it appears in the URL, Clarity election id)
+# --- Counties on Clarity Elections:  https://results.enr.clarityelections.com/CA/<County>/<election id>/ ----
+#   tab name -> (County exactly as written in that URL, Clarity election id)
+# Clarity sits behind Amazon's bot protection, which sometimes answers scripts with "HTTP 202" instead of the data.
+# fetch_clarity() therefore tries an ordinary request first and, if that is refused, a real headless browser.
 CLARITY_SOURCES = {
-    "RAW_Butte": ("Butte", "126778"),   # id confirmed on buttevotes.ca.gov's Nov 3, 2026 page
+    "RAW_Butte":       ("Butte", "126778"),         # id confirmed on buttevotes.ca.gov's Nov 3, 2026 page
+    "RAW_ContraCosta": ("Contra_Costa", "127405"),  # note the underscore in the URL
 }
 
-# Counties on livevoterturnout.com (same vendor as San Diego), with names cleaned up.
-#   tab name -> Index page URL
+# --- Counties on livevoterturnout.com whose HTML pages we read (same vendor as San Diego) ----------------
+#   tab name -> Index page URL.   Names are tidied ("X (DEM) X, DEM" -> "X") and a Party column is added.
 LVT_CLEAN_SOURCES = {
     "RAW_Riverside":     "https://www.livevoterturnout.com/ENR/riversidecaenr/12/en/Index_12.html",
     "RAW_SanBernardino": "https://www.livevoterturnout.com/ENR/sanbernardinocaenr/3/en/Index_3.html",
     "RAW_Imperial":      "https://www.livevoterturnout.com/ENR/imperialcaenr/6/en/Index_6.html",
 }
 
+# --- Counties on livevoterturnout.com that also publish a clean XML summary feed (Orange County) ----------
+#   tab name -> URL of summary_<id>.xml  (the same file name pattern probably exists for the other
+#   livevoterturnout.com counties above - a sturdier source than their HTML if those pages ever change).
+LVT_XML_SOURCES = {
+    "RAW_OrangeCounty": "https://www.livevoterturnout.com/ENR/orangecaenr/24/summary_24.xml",
+}
+
+# San Francisco: the numbers are on index.html (detail.html is only a menu of PDF/Excel links).
 SF_RESULTS_URL = "https://www.sfelections.org/results/20261103/index.html"
 
-# California Secretary of State statewide results.
-# (file on media.sos.ca.gov, matching api.sos.ca.gov path, required?)
-# "required" files must all load or the tab is left untouched; optional ones just log a warning.
+# --- California Secretary of State statewide results -------------------------------------------------------
+# (file name on media.sos.ca.gov, matching api.sos.ca.gov path, required?)
+# "required" files must ALL load or the RAW_Statewide tab is left untouched; optional files only log a warning.
+# The media.sos.ca.gov copy is meant for scripts; api.sos.ca.gov (same data) is the fallback.
 SOS_MEDIA = "https://media.sos.ca.gov/media"
 SOS_API = "https://api.sos.ca.gov/returns"
 SOS_FILES = [
@@ -104,19 +154,21 @@ SOS_FILES = [
     ("state-senate",                         "state-senate/district/all",           True),
     ("state-assembly",                       "state-assembly/district/all",         True),
     ("board-of-equalization",                "board-of-equalization/district/all",  False),
-    ("supreme-court",                        "supreme-court",                       False),
-    ("court-of-appeal",                      "courts-of-appeal/district/all",       False),
+    ("supreme-court",                        "supreme-court",                       False),   # judges: log says "no whole-race results" - harmless
+    ("court-of-appeal",                      "courts-of-appeal/district/all",       False),   # judges: same
 ]
 
 # =====================================================================================
-# SMALL HELPERS
+# SMALL HELPERS (used by the newer fetchers further down)
 # =====================================================================================
 
 def strip_ns(tag: str) -> str:
+    """'{http://x}Foo' -> 'Foo'  (XML tags sometimes carry a namespace we do not care about)."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
 def clean(s) -> str:
+    """Collapse all whitespace runs to single spaces and trim."""
     return re.sub(r"\s+", " ", s or "").strip()
 
 
@@ -133,7 +185,7 @@ def to_int(x):
 
 
 def pct_text(x) -> str:
-    """'65.6' -> '65.6%' (Google Sheets then stores it as a real percentage, like your other tabs)."""
+    """'65.6' -> '65.6%'  (Google Sheets then stores a real percentage, like your other tabs)."""
     s = clean(str(x)) if x is not None else ""
     if not s:
         return ""
@@ -141,15 +193,22 @@ def pct_text(x) -> str:
 
 
 def http_get(url, *, retries=3, timeout=30, headers=None):
-    """GET with retries on 5xx / 429 / network errors. Raises RuntimeError with a useful message."""
+    """GET with retries. Raises RuntimeError with a message that says exactly what the server did.
+
+    Retried:      network errors, HTTP 5xx, 429 (rate limit) and 202.
+    Not retried:  other 4xx (a 404 will not fix itself).
+    HTTP 202 deserves a note: Amazon's bot protection (Clarity sits behind it) answers "prove you are a browser"
+    with 202 + a tiny challenge page instead of the file.  Only a real browser can answer that - see BrowserGetter.
+    """
     last = "no attempt made"
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, headers=headers or HEADERS, timeout=timeout)
             if r.status_code == 200:
                 return r
-            last = f"HTTP {r.status_code} from {url} (server={r.headers.get('server')})"
-            if r.status_code < 500 and r.status_code != 429:
+            waf = r.headers.get("x-amzn-waf-action")
+            last = f"HTTP {r.status_code} from {url} (server={r.headers.get('server')}" + (f", waf-action={waf}" if waf else "") + ")"
+            if r.status_code < 500 and r.status_code not in (202, 429):
                 break  # 4xx: retrying will not help
         except requests.RequestException as e:
             last = f"{type(e).__name__} on {url}: {e}"
@@ -158,14 +217,14 @@ def http_get(url, *, retries=3, timeout=30, headers=None):
     raise RuntimeError(last)
 
 
+def maybe_gunzip(b: bytes) -> bytes:
+    """Un-gzip bytes if (and only if) they start with the gzip magic number.
+    Some servers send gzip WITHOUT the Content-Encoding header, so requests does not un-gzip it for us."""
+    return gzip.decompress(b) if b[:2] == b"\x1f\x8b" else b
+
+
 def body_bytes(resp) -> bytes:
-    """Response body, un-gzipping it ourselves if the server sent gzip WITHOUT a Content-Encoding header
-    (Clarity does this for some JSON files; requests then hands json() raw gzip bytes and fails with
-    'Expecting value: line 1 column 1 (char 0)')."""
-    b = resp.content
-    if b[:2] == b"\x1f\x8b":
-        b = gzip.decompress(b)
-    return b
+    return maybe_gunzip(resp.content)
 
 
 def json_from(resp):
@@ -179,10 +238,13 @@ def normalize(rows):
 
 
 # =====================================================================================
-# 1. EXISTING FETCHERS - unchanged from your version (the ALL tab points at their rows by cell address)
+# 1. EXISTING FETCHERS - unchanged logic (only comments were added)
+#    These write the tabs your ALL formulas used to point at by cell address (RAW_Alameda!D234 etc.),
+#    so their row layout is deliberately NOT touched. Once ALL uses RESULTS lookups it no longer matters.
+#    Each returns:  [header row, then one row per candidate/choice]
 # =====================================================================================
 
-# WORKING: Santa Barbara
+# WORKING: Santa Barbara - one static HTML page; contests are single-cell "(Vote for N)" rows, then candidate rows.
 def fetch_santa_barbara():
     url = "https://www.sbcvote.com/Elections/results/2026nov03/results-1.htm"
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -214,7 +276,7 @@ def fetch_santa_barbara():
     return rows
 
 
-# WORKING: Alameda Main
+# WORKING: Alameda Main - the county results page; each contest is a "panelDtl" block under a heading.
 def fetch_alameda_main():
     url = "https://www.alamedacountyca.gov/rovresults/260/"
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -239,9 +301,9 @@ def fetch_alameda_main():
     return rows
 
 
-# WORKING: Sacramento Web (Playwright)
+# WORKING: Sacramento Web - JavaScript page, so it needs the Playwright browser (passed in as `page`).
 # (This tab has some junk rows from nested HTML tables, but I left it alone on purpose:
-#  cleaning it up would shift the row numbers your ALL formulas point at.)
+#  cleaning it up would shift the row numbers your old ALL formulas point at. RESULTS filters the junk out.)
 def fetch_sacramento_web(page):
     page.goto("https://eresults.saccounty.net/", wait_until="networkidle", timeout=30000)
     soup = BeautifulSoup(page.content(), "html.parser")
@@ -267,7 +329,7 @@ def fetch_sacramento_web(page):
     return rows
 
 
-# WORKING: Los Angeles
+# WORKING: Los Angeles - the county's own JSON API: one call for the contest list, one for the live vote counters.
 def fetch_la():
     base = "https://results.lavote.gov/ElectionResults"
     hdrs = {**HEADERS, "Referer": "https://results.lavote.gov/"}
@@ -309,7 +371,9 @@ def fetch_la():
     return rows
 
 
-# WORKING: livevoterturnout.com multi-page static HTML crawler (San Diego)
+# WORKING: livevoterturnout.com multi-page static HTML crawler (San Diego).
+# Starts at the Index page, follows links to category pages (if any), and reads every results table.
+# A contest's name is taken from the heading of the panel/card that wraps its table.
 def fetch_lvt_multipage(index_url: str):
     resp = requests.get(index_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
@@ -360,12 +424,14 @@ def fetch_lvt_multipage(index_url: str):
 
 
 # =====================================================================================
-# 2. NEW: Riverside / San Bernardino / Imperial  (livevoterturnout.com, same crawler as San Diego)
+# 2. Riverside / San Bernardino / Imperial  (livevoterturnout.com HTML, same crawler as San Diego)
 #    The raw crawl doubles every name ("X (DEM) X, DEM", "YES YES"); these tabs get tidy names instead.
-#    Your San Diego tab is left exactly as it was.
+#    Your San Diego tab is left exactly as it was (RESULTS tidies it up the same way).
 # =====================================================================================
 
 def clean_lvt_contest(raw: str) -> str:
+    """'Contest: GOVERNOR, VOTE FOR 1 GOVERNOR (VOTE FOR 1)'  ->  'GOVERNOR (Vote for 1)'.
+    Anything that does not match that doubled pattern is returned unchanged (only whitespace-cleaned)."""
     s = clean(raw)
     s = re.sub(r"^Contest:\s*", "", s, flags=re.I)
     m = re.match(r"^(?P<t>.+?),\s*VOTE FOR (?P<n>\d+)\s+(?P=t)\s*\(VOTE FOR (?P=n)\)$", s, flags=re.I)
@@ -375,19 +441,23 @@ def clean_lvt_contest(raw: str) -> str:
 
 
 def clean_lvt_candidate(raw: str):
-    """'COREY A JACKSON (DEM) COREY A JACKSON, DEM' -> ('COREY A JACKSON', 'DEM');  'YES YES' -> ('YES', '')."""
+    """Returns (name, party).
+         'COREY A JACKSON (DEM) COREY A JACKSON, DEM'  ->  ('COREY A JACKSON', 'DEM')
+         'YES YES'                                     ->  ('YES', '')
+    A leading '*' (counties use it to mark incumbents) is dropped: in a spreadsheet lookup '*' is a wildcard."""
     s = clean(raw)
     m = re.match(r"^(?P<n>.+?)\s*\((?P<p>[^()]*)\)\s*(?P=n),\s*[A-Za-z .\-]+$", s)
     if m:
-        return m.group("n").strip(), m.group("p").strip()
-    m = re.match(r"^(?P<n>.+?)\s+(?P=n)$", s)
-    if m:
-        return m.group("n").strip(), ""
-    return s, ""
+        name, party = m.group("n").strip(), m.group("p").strip()
+    else:
+        m = re.match(r"^(?P<n>.+?)\s+(?P=n)$", s)
+        name, party = (m.group("n").strip(), "") if m else (s, "")
+    return name.lstrip("*").strip(), party
 
 
 def fetch_lvt_clean(index_url: str):
-    raw = fetch_lvt_multipage(index_url)  # the proven crawler above
+    """Runs the proven San Diego crawler, then tidies each row and adds a Party column."""
+    raw = fetch_lvt_multipage(index_url)
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party"]]
     for contest, cand, votes, pct, updated in raw[1:]:
         name, party = clean_lvt_candidate(cand)
@@ -396,16 +466,57 @@ def fetch_lvt_clean(index_url: str):
 
 
 # =====================================================================================
-# 3. NEW: San Francisco
+# 3. Orange County  (livevoterturnout.com's XML summary feed - structured, so no HTML guessing)
+#    One <Table> element per candidate: RaceName, ContestantName, Party, TotalVotes, ContestantVotePercent ...
+# =====================================================================================
+
+def _child_text(el, name: str) -> str:
+    for ch in el:
+        if strip_ns(ch.tag) == name:
+            return clean(ch.text or "")
+    return ""
+
+
+def fetch_lvt_xml(summary_url: str):
+    # The "v=" number is a cache-buster (the county's own page sends one too); a fresh value every run.
+    resp = http_get(f"{summary_url}?v={int(time.time() * 1000)}", timeout=60)
+    root = ET.fromstring(body_bytes(resp))
+
+    source_updated = ""
+    gen = _child_text(root, "GeneratedDate")  # e.g. 2026-11-13T16:54:35.314-08:00  (already Pacific time)
+    if gen:
+        source_updated = gen[:16].replace("T", " ")
+
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party", "Reporting", "Source Updated"]]
+    for el in root.iter():
+        if strip_ns(el.tag) != "Table":
+            continue
+        contest = _child_text(el, "RaceName")
+        name = _child_text(el, "ContestantName").lstrip("*").strip()   # '*' marks incumbents; also a sheet wildcard
+        party = _child_text(el, "Party")
+        if party:  # 'XAVIER BECERRA (DEM)' -> 'XAVIER BECERRA' (the party has its own column)
+            name = re.sub(rf"\s*\({re.escape(party)}\)\s*$", "", name)
+        votes = to_int(_child_text(el, "TotalVotes"))
+        if not contest or not name or votes is None:
+            continue
+        reporting = f"{_child_text(el, 'PrecReported')} of {_child_text(el, 'NumberOfPrec')} precincts"
+        rows.append([contest, name, votes, _child_text(el, "ContestantVotePercent"), NOW, party, reporting, source_updated])
+    return rows
+
+
+# =====================================================================================
+# 4. San Francisco
 #    Your old URL (detail.html) is only a menu of PDF/Excel links, which is why it parsed to 0 rows.
 #    The numbers live on index.html: one <h4> per contest followed by one results table.
-#    Ranked-choice contests show "Round 1" and the last round; the Round column says which one you see.
+#    Ranked-choice contests show "Round 1" and the last round; the Round column says which one a row shows
+#    (finalists show the LAST round; an eliminated candidate shows Round 1 plus "eliminated in Round N").
 # =====================================================================================
 
 def fetch_sf():
     resp = http_get(SF_RESULTS_URL, timeout=30)
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    # "Last Update: November 10, 2026 4:00 PM" appears near the top of the page.
     source_updated = ""
     m = re.search(r"Last Update:\s*([A-Za-z]+ \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M)", soup.get_text(" ", strip=True))
     if m:
@@ -416,12 +527,12 @@ def fetch_sf():
 
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Round", "Source Updated"]]
     contest = None
-    for el in soup.find_all(["h4", "table"]):
+    for el in soup.find_all(["h4", "table"]):          # walk headings and tables in page order
         if el.name == "h4":
             contest = clean(el.get_text(" ", strip=True))
             continue
         if not contest:
-            continue  # tables before the first contest heading (turnout summary)
+            continue  # tables before the first contest heading (the turnout summary)
         trs = el.find_all("tr")
         if not trs:
             continue
@@ -439,12 +550,12 @@ def fetch_sf():
             if low == "total" or low.startswith(("under vote", "over vote", "undervote", "overvote")):
                 continue
 
-            if not is_rcv:
+            if not is_rcv:  # ordinary contest: [name, votes, pct]
                 votes = to_int(cells[1])
                 if votes is None:
                     continue
                 rows.append([contest, name, votes, cells[2] if len(cells) > 2 else "", NOW, "", source_updated])
-            else:
+            else:           # ranked-choice: one cell per round, like "23,059 (83.94%)" or "*eliminated in Round 2*"
                 votes, pct, label, elim = None, "", "", ""
                 for header, cell in zip(first[1:], cells[1:]):
                     mm = re.match(r"^([\d,]+)\s*\(([\d.]+%)\)", cell)
@@ -464,19 +575,30 @@ def fetch_sf():
 
 
 # =====================================================================================
-# 4. NEW: Butte County (Clarity Elections)
-#    Why it failed before: (a) ALL.json is not a real Clarity file - the data is json/en/summary.json;
-#    (b) Clarity sometimes sends that file gzipped without a Content-Encoding header, so requests'
-#    .json() choked ("Expecting value: line 1 column 1 (char 0)"). Both are handled here.
-#    If the JSON route ever fails, it falls back to Clarity's detailxml.zip download.
+# 5. Clarity Elections counties (Butte, Contra Costa)
+#
+#    What the data is:   <root>/current_ver.txt  -> a version number (changes on every upload)
+#                        <root>/<ver>/json/en/summary.json -> every contest with candidates and vote counts
+#                        <root>/<ver>/reports/detailxml.zip -> same data as XML (our fallback)
+#
+#    What went wrong on Nov 15: Clarity sits behind Amazon CloudFront + AWS WAF bot protection. When it does not
+#    like the visitor it returns "HTTP 202" and a challenge page instead of the file. python-requests cannot answer
+#    the challenge; a real browser can.  Whether a given run is challenged seems to depend on the runner's IP
+#    address, which changes from run to run - that is why Butte worked once and then failed.
+#
+#    So every Clarity fetch goes through a "getter" (url -> bytes):
+#        plain_getter     ordinary HTTP request. Fast. Tried first.
+#        BrowserGetter    headless Chromium (already installed for Sacramento). Used only when plain was refused.
 # =====================================================================================
 
 CLARITY_ROOT = "https://results.enr.clarityelections.com/CA"
 
 
 def clarity_rows_from_json(data):
+    """summary.json -> rows.  Keys used: C = contest title, CH = candidate names, V = vote counts.
+    Percentages are computed from the votes (so we never depend on what Clarity calls its percent field)."""
     contests = data
-    if isinstance(data, dict):  # tolerate {"Contests": [...]}-style wrappers
+    if isinstance(data, dict):  # tolerate a {"Contests": [...]}-style wrapper
         contests = next((v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)), [])
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party"]]
     for c in contests or []:
@@ -493,12 +615,13 @@ def clarity_rows_from_json(data):
         total = sum(vlist)
         for i, (n, v) in enumerate(zip(names, vlist)):
             party = parties[i] if i < len(parties) else ""
-            party = party if isinstance(party, str) and not re.fullmatch(r"[\d.,%\s]*", party) else ""
-            rows.append([title, clean(n), v, f"{v / total * 100:.2f}%" if total else "", NOW, party])
+            party = party if isinstance(party, str) and not re.fullmatch(r"[\d.,%\s]*", party) else ""  # 'P' can hold percents
+            rows.append([title, clean(n).lstrip("*").strip(), v, f"{v / total * 100:.2f}%" if total else "", NOW, party])
     return rows
 
 
 def clarity_rows_from_zip(content: bytes):
+    """Fallback: detailxml.zip -> rows  (<Contest text=...> containing <Choice text=... totalVotes=...>)."""
     with zipfile.ZipFile(io.BytesIO(content)) as z:
         xml_name = next(n for n in z.namelist() if n.lower().endswith(".xml"))
         root = ET.fromstring(z.read(xml_name))
@@ -511,13 +634,71 @@ def clarity_rows_from_zip(content: bytes):
         vlist = [to_int(ch.attrib.get("totalVotes")) or 0 for ch in choices]
         total = sum(vlist)
         for ch, v in zip(choices, vlist):
-            rows.append([title, clean(ch.attrib.get("text", "")), v, f"{v / total * 100:.2f}%" if total else "", NOW, ch.attrib.get("party", "")])
+            rows.append([title, clean(ch.attrib.get("text", "")).lstrip("*").strip(), v,
+                         f"{v / total * 100:.2f}%" if total else "", NOW, ch.attrib.get("party", "")])
     return rows
 
 
-def fetch_clarity(county_slug: str, election_id: str):
+def plain_getter(url: str) -> bytes:
+    """Default Clarity downloader: a normal HTTP request (2 tries). Raises if the server refuses (e.g. HTTP 202)."""
+    return body_bytes(http_get(url, timeout=30, retries=2))
+
+
+# JavaScript that runs INSIDE the browser page: downloads a URL with the browser's own network stack
+# (so it carries the cookie the bot-protection gave the browser) and hands the bytes back as base64.
+BROWSER_FETCH_JS = """
+async (url) => {
+  const r = await fetch(url, {credentials: 'include', cache: 'no-store'});
+  const buf = new Uint8Array(await r.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < buf.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  }
+  return {status: r.status, waf: r.headers.get('x-amzn-waf-action') || '', b64: btoa(bin)};
+}
+"""
+
+
+class BrowserGetter:
+    """Callable  url -> bytes  that downloads through a real headless Chromium.
+
+    1. The first call opens `warm_url` (the county's normal results page). Amazon's bot protection challenges
+       the browser, the browser solves it automatically and receives a cookie.
+    2. Every download then runs as an in-page fetch() carrying that cookie.
+    While the challenge is still being solved the page is reloading, so a download can fail or return 202;
+    we simply try again every few seconds (up to ~24 s) before giving up."""
+
+    def __init__(self, context, warm_url: str, tries: int = 8, delay: float = 3.0):
+        self.context, self.warm_url, self.tries, self.delay = context, warm_url, tries, delay
+        self.page = None
+
+    def __call__(self, url: str) -> bytes:
+        if self.page is None:
+            self.page = self.context.new_page()
+            self.page.goto(self.warm_url, wait_until="domcontentloaded", timeout=60000)
+        last = "no attempt made"
+        for _ in range(self.tries):
+            try:
+                res = self.page.evaluate(BROWSER_FETCH_JS, url)
+                if res["status"] == 200:
+                    return maybe_gunzip(base64.b64decode(res["b64"]))
+                last = f"HTTP {res['status']}" + (f" (waf-action={res['waf']})" if res["waf"] else "")
+            except Exception as e:  # e.g. "Execution context was destroyed" while the page reloads
+                last = f"{type(e).__name__}: {clean(str(e))[:100]}"
+            time.sleep(self.delay)
+        raise RuntimeError(f"{url} via browser: {last}")
+
+    def close(self):
+        if self.page is not None:
+            self.page.close()
+            self.page = None
+
+
+def fetch_clarity(county_slug: str, election_id: str, getter=None):
+    """Download one Clarity election and return rows.  `getter` is plain_getter unless a BrowserGetter is passed."""
+    get = getter or plain_getter
     root = f"{CLARITY_ROOT}/{county_slug}/{election_id}"
-    ver = http_get(f"{root}/current_ver.txt", timeout=20).text.strip()
+    ver = get(f"{root}/current_ver.txt").decode("utf-8", "ignore").strip()
     if not re.fullmatch(r"\d+", ver):
         raise RuntimeError(f"{root}/current_ver.txt did not return a version number: {ver[:80]!r}")
     base = f"{root}/{ver}"
@@ -525,7 +706,7 @@ def fetch_clarity(county_slug: str, election_id: str):
     errors = []
     for path in ("json/en/summary.json", "json/summary.json"):
         try:
-            data = json_from(http_get(f"{base}/{path}", timeout=30))
+            data = json.loads(get(f"{base}/{path}").decode("utf-8-sig"))
             rows = clarity_rows_from_json(data)
             if len(rows) > 1:
                 return rows
@@ -533,7 +714,7 @@ def fetch_clarity(county_slug: str, election_id: str):
         except Exception as e:
             errors.append(f"{path}: {e}")
     try:
-        rows = clarity_rows_from_zip(http_get(f"{base}/reports/detailxml.zip", timeout=60).content)
+        rows = clarity_rows_from_zip(get(f"{base}/reports/detailxml.zip"))
         if len(rows) > 1:
             return rows
         errors.append("reports/detailxml.zip: loaded but parsed 0 rows")
@@ -543,11 +724,13 @@ def fetch_clarity(county_slug: str, election_id: str):
 
 
 # =====================================================================================
-# 5. NEW: Statewide results from the California Secretary of State
-#    Uses the SOS's media feed (media.sos.ca.gov), which is meant for scripts, and falls back to
-#    api.sos.ca.gov. Only the whole-race sections ("... - Statewide Results" / "... - Districtwide
-#    Results") are kept; the per-county slices inside those files are skipped.
-#    Columns A-E match your other RAW tabs, so lookups work the same way.
+# 6. Statewide results from the California Secretary of State  ->  RAW_Statewide
+#    Uses the SOS's media feed (media.sos.ca.gov), which is meant for scripts, and falls back to api.sos.ca.gov.
+#    Each feed file holds, for one contest family, a list of "sections": one for the whole race
+#    ("Governor - Statewide Results", "U.S. House of Representatives District 4 - Districtwide Results") followed by
+#    one per county. We keep ONLY the whole-race sections.
+#    Columns A-E match the other RAW tabs.  "Key" is a short lookup code ("CD 4", "SD 2", "AD 12", "Prop 40").
+#    "SOS As Of" is the time the SOS stamped on that contest - it can differ between contest families.
 # =====================================================================================
 
 def sos_get(media_name: str, api_path: str):
@@ -561,6 +744,7 @@ def sos_get(media_name: str, api_path: str):
 
 
 def sos_sections(data):
+    """Normalize the two shapes the feeds come in into a plain list of sections."""
     if isinstance(data, dict):
         if isinstance(data.get("ballot-measures"), list):
             return [{"raceTitle": "Ballot Measures - Statewide Results",
@@ -574,6 +758,7 @@ def sos_sections(data):
 
 
 def parse_sos_time(s: str) -> str:
+    """'November 14, 2026, 5:16 p.m.' -> '2026-11-14 17:16' (so Google Sheets treats it as a date-time)."""
     s2 = clean(s).replace("a.m.", "AM").replace("p.m.", "PM")
     for fmt in ("%B %d, %Y, %I:%M %p", "%B %d, %Y %I:%M %p"):
         try:
@@ -603,12 +788,12 @@ def sos_rows(sections):
             continue
         m = re.match(r"^(?P<c>.+?)\s+-\s+(?:Statewide|Districtwide) Results$", clean(sec.get("raceTitle", "")))
         if not m:
-            continue  # a county slice of a race
+            continue  # a county slice of a race: skip
         base = m.group("c")
         reporting = clean(sec.get("Reporting", ""))
         as_of = parse_sos_time(sec.get("ReportingTime", ""))
 
-        for meas in sec.get("ballot-measures") or []:
+        for meas in sec.get("ballot-measures") or []:  # propositions: one Yes row + one No row each
             num = re.sub(r"^0+", "", str(meas.get("Number", ""))) or "0"
             contest = f"Proposition {num}"
             for side in ("Yes", "No"):
@@ -622,7 +807,7 @@ def sos_rows(sections):
                 v = to_int(cand.get("Votes"))
                 out.append([base, name, "" if v is None else v, pct_text(cand.get("Percent")),
                             NOW, party, sos_key(base), reporting, as_of, ""])
-            elif "yesVotes" in cand or "noVotes" in cand:  # retention-style entries
+            elif "yesVotes" in cand or "noVotes" in cand:  # retention-style entries (judges)
                 for side in ("Yes", "No"):
                     v = to_int(cand.get(f"{side.lower()}Votes"))
                     out.append([base, f"{name} - {side}", "" if v is None else v, pct_text(cand.get(f"{side.lower()}Percent")),
@@ -646,9 +831,10 @@ def fetch_statewide():
 
 
 # =====================================================================================
-# 6. RANKED-CHOICE (RCV) tabs for Alameda County
-#    Same parser as before, now run once per entry in RCV_ALAMEDA. Extra columns on the right
-#    (Report Time, Status, Seats) are new; columns A-F are exactly what your RCV_Alameda tab has today.
+# 7. Ranked-choice (RCV) tabs for Alameda County - one tab per race, round by round
+#    Same parser as before, now run once per entry in RCV_ALAMEDA. Columns A-F are exactly what your original
+#    RCV_Alameda tab had; Report Time / Status / Seats were added on the right.
+#    (Alameda's report is a SQL Server Reporting Services XML export - hence the odd names Tablix5, Textbox86...)
 # =====================================================================================
 
 def alameda_rcv_url(race: str) -> str:
@@ -659,19 +845,22 @@ def fetch_alameda_rcv(xml_url: str):
     resp = http_get(xml_url, timeout=20)
     root = ET.fromstring(body_bytes(resp))
 
+    # Contest-level facts live on the "Tablix2" element.
     contest_title, report_time, status, seats = "Alameda RCV", "", "", ""
     for elem in root.iter():
         if strip_ns(elem.tag) == "Tablix2" and "Textbox24" in elem.attrib:
             contest_title = elem.attrib["Textbox24"]
             report_time = elem.attrib.get("timeStamp", "").replace("T", " ")[:16]
-            status = elem.attrib.get("state", "")
-            ms = re.search(r"(\d+)", elem.attrib.get("Textbox53", ""))
+            status = elem.attrib.get("state", "")                       # e.g. "All Positions Filled"
+            ms = re.search(r"(\d+)", elem.attrib.get("Textbox53", ""))  # "Number of positions to elect is 2."
             seats = int(ms.group(1)) if ms else ""
             break
 
     rows = [["Contest", "Round", "Candidate", "Votes", "Pct", "Source URL", "Report Time", "Status", "Seats"]]
     current_round = ""
 
+    # Document order matters: a "Tablix5" element names the round ("Round 2"); the "choiceGroup" elements that
+    # follow it are that round's candidates (plus "Blanks", "Exhausted", "Overvotes" pseudo-rows).
     for elem in root.iter():
         tag = strip_ns(elem.tag)
         if tag == "Tablix5" and "Textbox86" in elem.attrib:
@@ -708,25 +897,29 @@ def discover_alameda_rcv():
 # RUNNER
 # =====================================================================================
 
-def run_source(tabs, status, tab_name, fetcher):
+def run_source(tabs, status, tab_name, fetcher, note=""):
+    """Run one fetcher. Success -> its rows go into `tabs`. Failure or zero rows -> nothing is written for that
+    tab (it keeps its previous data) and the reason is recorded in `status` (the STATUS tab).
+    `status` is a dict keyed by tab name, so a second attempt for the same tab simply replaces the first."""
     try:
         rows = fetcher()
         n = len(rows) - 1
         if n <= 0:
             print(f"[EMPTY] {tab_name}: parsed 0 rows - leaving the tab's previous data alone")
-            status.append([tab_name, "EMPTY (previous data kept)", 0, "Page loaded but no results were parsed", NOW_PT])
+            status[tab_name] = [tab_name, "EMPTY (previous data kept)", 0, "Page loaded but no results were parsed", NOW_PT]
             return
         tabs[tab_name] = normalize(rows)
-        print(f"[OK] {tab_name}: fetched {n} rows")
-        status.append([tab_name, "OK", n, "", NOW_PT])
+        print(f"[OK] {tab_name}: fetched {n} rows" + (f" ({note})" if note else ""))
+        status[tab_name] = [tab_name, "OK", n, note, NOW_PT]
     except Exception as e:
         print(f"[ERROR] {tab_name} failed: {e}")
-        status.append([tab_name, "ERROR (previous data kept)", "", str(e)[:300], NOW_PT])
+        status[tab_name] = [tab_name, "ERROR (previous data kept)", "", str(e)[:300], NOW_PT]
 
 
 def main():
-    tabs, status = {}, []
+    tabs, status = {}, {}
 
+    # ---- Stage 1: everything that works with plain HTTP requests -----------------------------------------
     sources = {
         "RAW_SantaBarbara": fetch_santa_barbara,
         "RAW_Alameda": fetch_alameda_main,
@@ -736,9 +929,11 @@ def main():
         "RAW_Statewide": fetch_statewide,
     }
     for tab, (county, election_id) in CLARITY_SOURCES.items():
-        sources[tab] = lambda c=county, e=election_id: fetch_clarity(c, e)
+        sources[tab] = lambda c=county, e=election_id: fetch_clarity(c, e)          # plain request first
     for tab, url in LVT_CLEAN_SOURCES.items():
         sources[tab] = lambda u=url: fetch_lvt_clean(u)
+    for tab, url in LVT_XML_SOURCES.items():
+        sources[tab] = lambda u=url: fetch_lvt_xml(u)
     for tab, race in RCV_ALAMEDA.items():
         sources[tab] = lambda r=race: fetch_alameda_rcv(alameda_rcv_url(r))
 
@@ -750,27 +945,46 @@ def main():
     except Exception as e:
         print(f"[INFO] RCV discovery skipped: {e}")
 
+    # ---- Stage 2: things that need a real browser ---------------------------------------------------------
+    #   (a) Clarity counties that were refused in stage 1  (b) Sacramento, which is a JavaScript page.
+    clarity_blocked = [t for t in CLARITY_SOURCES if t not in tabs]
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            page = browser.new_page()  # Sacramento's page - set up exactly as before
+
+            if clarity_blocked:
+                ctx = browser.new_context(user_agent=HEADERS["User-Agent"], locale="en-US")
+                for tab in clarity_blocked:
+                    county, election_id = CLARITY_SOURCES[tab]
+                    plain_error = status[tab][3]
+                    getter = BrowserGetter(ctx, f"{CLARITY_ROOT}/{county}/{election_id}/")
+                    run_source(tabs, status, tab, lambda c=county, e=election_id, g=getter: fetch_clarity(c, e, g),
+                               note="fetched through the browser (a plain request was refused)")
+                    getter.close()
+                    if tab not in tabs:  # still failing: keep both explanations
+                        status[tab][3] = f"plain: {plain_error} || browser: {status[tab][3]}"[:300]
+
             run_source(tabs, status, "RAW_Sacramento", lambda: fetch_sacramento_web(page))
             browser.close()
     except Exception as e:
-        print(f"[ERROR] RAW_Sacramento (browser) failed: {e}")
-        status.append(["RAW_Sacramento", "ERROR (previous data kept)", "", str(e)[:300], NOW_PT])
+        print(f"[ERROR] browser stage failed: {e}")
+        if "RAW_Sacramento" not in status:
+            status["RAW_Sacramento"] = ["RAW_Sacramento", "ERROR (previous data kept)", "", str(e)[:300], NOW_PT]
 
+    # ---- Stage 3: send everything to Google Sheets --------------------------------------------------------
     # STATUS tab: one row per source, so you can see at a glance which tabs are stale and why.
-    tabs["STATUS"] = normalize([["Tab", "Status", "Rows", "Detail", "Run time (Pacific)"]] + status)
+    tabs["STATUS"] = normalize([["Tab", "Status", "Rows", "Detail", "Run time (Pacific)"]] + list(status.values()))
 
     if len(tabs) == 1:
         print("Nothing was fetched - not calling the Google Sheet.")
         sys.exit(1)
 
-    res = requests.post(WEBHOOK_URL, json={"secret": SECRET_TOKEN, "tabs": tabs}, timeout=60)
+    res = requests.post(WEBHOOK_URL, json={"secret": SECRET_TOKEN, "tabs": tabs}, timeout=90)
     print("Google Sheet response:", res.status_code, res.text[:200])
-    if res.status_code != 200 or res.text.strip() != "Success":
-        sys.exit(1)  # make the GitHub run turn red if the sheet did not accept the data
+    # The Apps Script answers "Success" (optionally followed by a note). Anything else = the sheet rejected the data.
+    if res.status_code != 200 or not res.text.strip().startswith("Success"):
+        sys.exit(1)  # make the GitHub run turn red
 
 
 if __name__ == "__main__":
