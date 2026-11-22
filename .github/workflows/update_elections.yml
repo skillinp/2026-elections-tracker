@@ -1,14 +1,25 @@
 name: Update California Election Results
 
+# This workflow now runs ONLY when asked to:
+#   - from the spreadsheet:  Elections > Update results now   (the sheet calls GitHub for you)
+#   - from GitHub:           Actions > Update California Election Results > Run workflow
+#
+# To put it back on a timer, remove the two "#" in front of the schedule lines below.
+# (:20 and :50 past each hour is good for catching 4:15 PM / 5:00 PM county drops.)
 on:
-  schedule:
-    # Runs at :20 and :50 past the hour (great for catching 4:15 PM / 5:00 PM county drops)
-    - cron: '20,50 * * * *'
-  workflow_dispatch: # Lets you click "Run workflow" manually anytime
+  # schedule:
+  #   - cron: '20,50 * * * *'
+  workflow_dispatch:
+
+# If you click "update" twice quickly, the second run waits for the first instead of running at the same time.
+concurrency:
+  group: update-election-results
+  cancel-in-progress: false
 
 jobs:
   scrape-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 15          # a stuck run stops by itself instead of hanging for hours
     defaults:
       run:
         working-directory: ./2026-elections
