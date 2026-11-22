@@ -20,10 +20,15 @@ HOW THE PIECES FIT TOGETHER
         v
     The ALL tab looks candidates up in RESULTS (by contest key + candidate name), never by cell address.
 
-TAB NAMING:  RAW_<place>  = what the county published (one row per candidate/choice)
-             RCV_<race>   = round-by-round ranked-choice results for one race
-             RESULTS      = built by Apps Script from all of the above (do not edit by hand)
-             STATUS       = written by this file: OK / EMPTY / ERROR for every source, every run
+TAB NAMING:  RAW_<place>      = what the county published (one row per candidate/choice)
+             RCV_<race>       = round-by-round ranked-choice results for one race
+             RAW_Unprocessed  = the counties' own estimates of ballots left to count (from the Secretary of State)
+             RESULTS          = built by Apps Script from all of the above (do not edit by hand)
+             COMBINED         = a small tab YOU edit: measures that span several counties, summed into RESULTS
+             STATUS           = written by this file: OK / EMPTY / ERROR for every source, every run
+
+HOW OFTEN IT RUNS:  only when you ask. In the spreadsheet: Elections > Update results now (that tells GitHub to run this
+                    file). Or in GitHub: Actions > Update California Election Results > Run workflow.
 
 WHERE TO ADD THINGS  (each is a one-line edit in the CONFIG block below)
     another ranked-choice (RCV) tab ............. RCV_ALAMEDA
@@ -36,9 +41,12 @@ NEXT-ELECTION CHECKLIST  (e.g. the 2028 primary) - what is tied to the 2026 gene
            "2026nov03"        fetch_santa_barbara   (Santa Barbara results page)
            "electionID=4348"  fetch_la              (LA County election id - appears twice)
            "/rovresults/260/" fetch_alameda_main    (Alameda election number)
-           "sandiegocaenr/25" main()                (San Diego livevoterturnout id)
+           "sandiegocaenr/25" LVT_CLEAN_SOURCES     (San Diego livevoterturnout id - now in the CONFIG block)
            "eresults.saccounty.net"  fetch_sacramento_web (same address every election; confirm it shows the new one)
-    3. SOS_FILES: the offices on the ballot change by year. Compare with the list at
+    3. UBS_URL / SOURCE_COUNTIES (the "ballots left" report): the page address is normally stable, but confirm the
+       table still has the columns "Estimated Total Ballots Remaining" and "Last Report". Add every new RAW_ tab to
+       SOURCE_COUNTIES so its county's figures get attached.
+    3b. SOS_FILES: the offices on the ballot change by year. Compare with the list at
        https://media.sos.ca.gov/media/json-endpoints.csv (it names every statewide feed for the current election).
     4. Look at the STATUS tab after the first run - any ERROR / EMPTY row tells you which source to fix.
 
@@ -67,10 +75,10 @@ from playwright.sync_api import sync_playwright
 WEBHOOK_URL = os.environ["APPS_SCRIPT_URL"]
 SECRET_TOKEN = os.environ["WEBHOOK_SECRET"]
 
-# NOTE: GitHub runners use UTC, so this "Updated" stamp is UTC (unchanged from your original version).
-# To stamp Pacific time instead, use:  datetime.now(ZoneInfo("America/Los_Angeles")).strftime(...)
-NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
-NOW_PT = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")  # used on the STATUS tab
+# Every "Updated" stamp is Pacific time. (Until Nov. 19 it was the GitHub runner's clock, which is UTC and so looked
+# 8 hours ahead. Google Sheets reads these strings in the spreadsheet's own time zone, so keep that set to Pacific.)
+NOW = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M")
+NOW_PT = NOW  # same thing; kept as a separate name because the STATUS tab uses it
 
 # A normal-looking browser identity. Some county sites refuse the default python-requests identity.
 HEADERS = {
@@ -114,14 +122,16 @@ RCV_ALAMEDA = {
 CLARITY_SOURCES = {
     "RAW_Butte":       ("Butte", "126778"),         # id confirmed on buttevotes.ca.gov's Nov 3, 2026 page
     "RAW_ContraCosta": ("Contra_Costa", "127405"),  # note the underscore in the URL
+    "RAW_SantaClara":  ("Santa_Clara", "127570"),   # needed for the five-county regional measure (RTM)
 }
 
 # --- Counties on livevoterturnout.com whose HTML pages we read (same vendor as San Diego) ----------------
-#   tab name -> Index page URL.   Names are tidied ("X (DEM) X, DEM" -> "X") and a Party column is added.
+#   tab name -> Index page URL.   (San Diego is here too, so it also gets the XML top-up.)  Names are tidied ("X (DEM) X, DEM" -> "X") and a Party column is added.
 LVT_CLEAN_SOURCES = {
     "RAW_Riverside":     "https://www.livevoterturnout.com/ENR/riversidecaenr/12/en/Index_12.html",
     "RAW_SanBernardino": "https://www.livevoterturnout.com/ENR/sanbernardinocaenr/3/en/Index_3.html",
     "RAW_Imperial":      "https://www.livevoterturnout.com/ENR/imperialcaenr/6/en/Index_6.html",
+    "RAW_SanDiego":      "https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html",
 }
 
 # --- Counties on livevoterturnout.com that also publish a clean XML summary feed (Orange County) ----------
@@ -129,6 +139,21 @@ LVT_CLEAN_SOURCES = {
 #   livevoterturnout.com counties above - a sturdier source than their HTML if those pages ever change).
 LVT_XML_SOURCES = {
     "RAW_OrangeCounty": "https://www.livevoterturnout.com/ENR/orangecaenr/24/summary_24.xml",
+}
+
+# --- "How many ballots are left?" -------------------------------------------------------------------------------
+# The Secretary of State publishes the counties' own estimates (ballots processed, ballots remaining, when each county
+# last reported and when it expects to report next) on a web page - there is no data feed for it, so a browser reads it.
+UBS_URL = "https://electionresults.sos.ca.gov/unprocessed-ballots-status"
+INCLUDE_CURE_IN_LEFT = False   # True = also count "ballots left to cure" (signature problems) as still-to-come
+
+# Which county (or counties) each RAW_ tab covers, so the right "ballots left" figure and "last reported" time can be
+# attached to it. County names are spelled as the SOS page spells them. RCV_ tabs are Alameda County automatically.
+SOURCE_COUNTIES = {
+    "RAW_SantaBarbara": ["Santa Barbara"], "RAW_Alameda": ["Alameda"], "RAW_LA": ["Los Angeles"], "RAW_SF": ["San Francisco"],
+    "RAW_SanDiego": ["San Diego"], "RAW_Butte": ["Butte"], "RAW_ContraCosta": ["Contra Costa"], "RAW_Riverside": ["Riverside"],
+    "RAW_SanBernardino": ["San Bernardino"], "RAW_Imperial": ["Imperial"], "RAW_OrangeCounty": ["Orange"],
+    "RAW_Sacramento": ["Sacramento"], "RAW_SantaClara": ["Santa Clara"],
 }
 
 # San Francisco: the numbers are on index.html (detail.html is only a menu of PDF/Excel links).
@@ -161,6 +186,10 @@ SOS_FILES = [
 # =====================================================================================
 # SMALL HELPERS (used by the newer fetchers further down)
 # =====================================================================================
+
+# Fetchers can leave a short remark for the STATUS tab here (key = tab name); run_source() picks it up.
+SOURCE_NOTES = {}
+
 
 def strip_ns(tag: str) -> str:
     """'{http://x}Foo' -> 'Foo'  (XML tags sometimes carry a namespace we do not care about)."""
@@ -455,13 +484,60 @@ def clean_lvt_candidate(raw: str):
     return name.lstrip("*").strip(), party
 
 
-def fetch_lvt_clean(index_url: str):
-    """Runs the proven San Diego crawler, then tidies each row and adds a Party column."""
-    raw = fetch_lvt_multipage(index_url)
-    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party"]]
+def norm_contest(s: str) -> str:
+    """Contest name -> comparison key: lower case, no '(Vote for N)', no punctuation. Used only to decide whether two
+    descriptions of the SAME contest (page vs XML feed) match."""
+    s = re.sub(r"\(\s*vote for \d+\s*\)|,?\s*vote for \d+", " ", s, flags=re.I)
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def lvt_xml_url(index_url: str):
+    """.../ENR/riversidecaenr/12/en/Index_12.html  ->  .../ENR/riversidecaenr/12/summary_12.xml  (None if not that shape)."""
+    u = re.sub(r"/en/Index_(\d+)\.html$", r"/summary_\1.xml", index_url)
+    return u if u != index_url else None
+
+
+def fetch_lvt_clean(index_url: str, note_key=None):
+    """Riverside / San Bernardino / Imperial.
+
+    1. Runs the proven page crawler (the same one San Diego uses) and tidies the names. These rows come FIRST and keep
+       their names, so keys you already built keep working.
+    2. The crawler misses some contests on these big pages (county boards of education, some school districts, some
+       city races). livevoterturnout.com also publishes the complete data as an XML feed, so any contest that is in the
+       XML but NOT on the page is appended after the page rows.
+    Safety rule: if fewer than half of the XML's contests can be matched by name to the page, the two sources name
+    things differently, so nothing is merged (that would create duplicates). The STATUS tab says which case happened."""
+    raw = fetch_lvt_multipage(index_url)  # the proven crawler above
+    html_rows = []
     for contest, cand, votes, pct, updated in raw[1:]:
         name, party = clean_lvt_candidate(cand)
-        rows.append([clean_lvt_contest(contest), name, votes, pct, updated, party])
+        html_rows.append([clean_lvt_contest(contest), name, votes, pct, updated, party])
+
+    extra, generated, note = [], "", ""
+    xml_url = lvt_xml_url(index_url)
+    if xml_url:
+        try:
+            xml_rows, generated = lvt_xml_fetch(xml_url)
+            html_names = {norm_contest(r[0]) for r in html_rows}
+            by_contest = {}
+            for r in xml_rows:
+                by_contest.setdefault(norm_contest(r[0]), []).append(r[:6])
+            matched = sum(1 for k in by_contest if k in html_names)
+            if by_contest and matched / len(by_contest) >= 0.5:
+                new = [k for k in by_contest if k not in html_names]
+                for k in new:
+                    extra.extend(by_contest[k])
+                note = f"page {len(html_rows)} rows + {len(extra)} rows from {len(new)} contests found only in the XML feed"
+            else:
+                note = f"XML feed found, but only {matched} of its {len(by_contest)} contests match the page by name - not merged"
+        except Exception as e:
+            note = f"XML feed not used ({clean(str(e))[:90]}); page rows only"
+    if note_key:
+        SOURCE_NOTES[note_key] = note
+    print(f"[INFO] {note_key or index_url}: {note}")
+
+    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party", "Source Updated"]]
+    rows.extend(r + [generated] for r in html_rows + extra)
     return rows
 
 
@@ -477,17 +553,14 @@ def _child_text(el, name: str) -> str:
     return ""
 
 
-def fetch_lvt_xml(summary_url: str):
-    # The "v=" number is a cache-buster (the county's own page sends one too); a fresh value every run.
-    resp = http_get(f"{summary_url}?v={int(time.time() * 1000)}", timeout=60)
-    root = ET.fromstring(body_bytes(resp))
-
+def lvt_xml_rows(root):
+    """Parse a livevoterturnout.com summary XML into rows
+    [contest, candidate, votes, pct, updated, party, reporting, source_updated] and the file's generated-at time."""
     source_updated = ""
     gen = _child_text(root, "GeneratedDate")  # e.g. 2026-11-13T16:54:35.314-08:00  (already Pacific time)
     if gen:
         source_updated = gen[:16].replace("T", " ")
-
-    rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party", "Reporting", "Source Updated"]]
+    rows = []
     for el in root.iter():
         if strip_ns(el.tag) != "Table":
             continue
@@ -501,7 +574,21 @@ def fetch_lvt_xml(summary_url: str):
             continue
         reporting = f"{_child_text(el, 'PrecReported')} of {_child_text(el, 'NumberOfPrec')} precincts"
         rows.append([contest, name, votes, _child_text(el, "ContestantVotePercent"), NOW, party, reporting, source_updated])
-    return rows
+    return rows, source_updated
+
+
+def lvt_xml_fetch(summary_url: str):
+    # The "v=" number is a cache-buster (the county's own page sends one too); a fresh value every run.
+    resp = http_get(f"{summary_url}?v={int(time.time() * 1000)}", timeout=60)
+    rows, generated = lvt_xml_rows(ET.fromstring(body_bytes(resp)))
+    if not rows:
+        raise RuntimeError("the XML feed loaded but contained no results")
+    return rows, generated
+
+
+def fetch_lvt_xml(summary_url: str):
+    rows, _ = lvt_xml_fetch(summary_url)
+    return [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party", "Reporting", "Source Updated"]] + rows
 
 
 # =====================================================================================
@@ -770,15 +857,41 @@ def parse_sos_time(s: str) -> str:
 
 def sos_key(contest: str) -> str:
     """Short lookup key that matches the labels in your ALL tab: 'CD 4', 'SD 2', 'AD 12', 'Prop 40'."""
-    for pat, tag in ((r"^U\.?S\.?\s+(?:House|Rep)[^\d]*(\d+)$", "CD"),
-                     (r"^State\s+Senat[^\d]*(\d+)$", "SD"),
-                     (r"^State\s+Assembl[^\d]*(\d+)$", "AD"),
+    # The SOS's own names: "United States Representative District 4", "State Senate District 2",
+    # "State Assembly Member District 12", "Board of Equalization Member District 1", and our "Proposition 4".
+    for pat, tag in ((r"^(?:U\.?S\.?|United States)\s+(?:House|Rep\w*)[^\d]*(\d+)$", "CD"),
+                     (r"^State\s+Senat\w*[^\d]*(\d+)$", "SD"),
+                     (r"^State\s+Assembl\w*[^\d]*(\d+)$", "AD"),
                      (r"^Board of Equalization[^\d]*(\d+)$", "BOE"),
                      (r"^Proposition\s+(\d+)$", "Prop")):
         m = re.match(pat, contest, flags=re.I)
         if m:
             return f"{tag} {int(m.group(1))}"
     return contest
+
+
+# contest label -> {county: total votes in that county}. Filled by fetch_statewide(), used by add_left_columns().
+SOS_COUNTY_VOTES = {}
+
+
+def sos_county_votes(sections):
+    """The per-county slices of each race (the ones sos_rows() skips): {contest: {county: votes}}."""
+    out = {}
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        m = re.match(r"^(?P<c>.+?)\s+-\s+(?P<county>.+?)(?:\s+County)?\s+Results$", clean(sec.get("raceTitle", "")))
+        if not m or m.group("county").lower() in ("statewide", "districtwide"):
+            continue
+        base, county = m.group("c"), m.group("county")
+        for meas in sec.get("ballot-measures") or []:
+            num = re.sub(r"^0+", "", str(meas.get("Number", ""))) or "0"
+            v = (to_int(meas.get("yesVotes")) or 0) + (to_int(meas.get("noVotes")) or 0)
+            out.setdefault(f"Proposition {num}", {})[county] = v
+        cands = sec.get("candidates") or []
+        if cands:
+            out.setdefault(base, {})[county] = sum(to_int(c.get("Votes")) or 0 for c in cands)
+    return out
 
 
 def sos_rows(sections):
@@ -819,7 +932,9 @@ def fetch_statewide():
     rows = [["Contest", "Candidate", "Votes", "Pct", "Updated", "Party", "Key", "Reporting", "SOS As Of", "Description"]]
     for media_name, api_path, required in SOS_FILES:
         try:
-            part = sos_rows(sos_sections(sos_get(media_name, api_path)))
+            sections = sos_sections(sos_get(media_name, api_path))
+            part = sos_rows(sections)
+            SOS_COUNTY_VOTES.update(sos_county_votes(sections))
             if not part:
                 raise RuntimeError("loaded but contained no whole-race results")
             rows.extend(part)
@@ -894,6 +1009,180 @@ def discover_alameda_rcv():
 
 
 # =====================================================================================
+# 8. "How many ballots are left?"  (Secretary of State Unprocessed Ballot Status report)  ->  RAW_Unprocessed
+#
+#    Counties send the SOS their own estimates (ballots processed so far, ballots still to count, when they last
+#    reported, when they expect to report next). The SOS shows them on a web page - no data feed - so a browser reads it.
+#    From it we work out, per county:   left = remaining / (processed + remaining)
+#    and attach it to every RAW_ tab of that county as an "Est. % Left" column, plus the county's "last reported" time
+#    as "Source Updated" (when the county did not give us its own time). Your ALL tab picks both up through RESULTS.
+#
+#    How good is it?  It is the counties' own estimate, rolled up by the state - not AP's number (AP's is proprietary and
+#    contest-specific). For a local race it is the whole county's figure, which is a reasonable guide, not an exact one.
+#    Statewide and district races are averaged over their counties, weighting each by its votes in that race.
+# =====================================================================================
+
+UBS_DATA = {}   # county (lower case) -> {"county", "processed", "remaining", "cure", "last", "next"}; filled by fetch_unprocessed()
+
+
+def _ubs_num(s) -> int:
+    s = clean(s).replace(",", "")
+    return int(float(s)) if re.fullmatch(r"-?\d+(\.\d+)?", s) else 0
+
+
+def _ubs_time(s) -> str:
+    """'11/16/26 6:56 PM' -> '2026-11-16 18:56'; anything else ('N/A', 'TBD') is kept as text."""
+    s = clean(s)
+    for fmt in ("%m/%d/%y %I:%M %p", "%m/%d/%Y %I:%M %p"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    return s
+
+
+def parse_ubs_html(html: str) -> dict:
+    """The SOS table -> {county_lower: record}. Columns are found by their header text, so a reordered table still works."""
+    soup = BeautifulSoup(html, "html.parser")
+    out = {}
+    for tbl in soup.find_all("table"):
+        trs = tbl.find_all("tr")
+        header, h_idx = None, None
+        for i, tr in enumerate(trs):
+            cells = [clean(c.get_text(" ", strip=True)).lower() for c in tr.find_all(["th", "td"])]
+            if "county" in cells and any("estimated total ballots remaining" in c for c in cells):
+                header, h_idx = cells, i
+                break
+        if header is None:
+            continue
+
+        def find(pred):
+            return next((i for i, c in enumerate(header) if pred(c)), None)
+        ci = header.index("county")
+        pi = find(lambda c: c.startswith("cumulative total"))
+        ri = find(lambda c: "estimated total ballots remaining" in c)
+        ki = find(lambda c: "left to cure" in c)
+        li = find(lambda c: c == "last report")
+        ni = find(lambda c: c.startswith("next results"))
+        for tr in trs[h_idx + 1:]:
+            cells = [clean(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+            if len(cells) <= max(i for i in (ci, ri, pi) if i is not None):
+                continue
+            name = cells[ci]
+            if not name or re.search(r"total|statewide", name, re.I):
+                continue
+            rec = {"county": name,
+                   "processed": _ubs_num(cells[pi]) if pi is not None else 0,
+                   "remaining": _ubs_num(cells[ri]),
+                   "cure": _ubs_num(cells[ki]) if ki is not None and ki < len(cells) else 0,
+                   "last": _ubs_time(cells[li]) if li is not None and li < len(cells) else "",
+                   "next": _ubs_time(cells[ni]) if ni is not None and ni < len(cells) else ""}
+            old = out.get(name.lower())
+            if old is None or rec["last"] >= old["last"]:
+                out[name.lower()] = rec
+    if not out:
+        raise RuntimeError("no Unprocessed Ballots table found on the page (blocked, or the layout changed). Page text began: "
+                           + clean(soup.get_text())[:150])
+    return out
+
+
+def left_fraction(rec: dict) -> float:
+    """Share of the ballots this county will end up counting that are still uncounted (0.0 - 1.0)."""
+    remaining = rec["remaining"] + (rec["cure"] if INCLUDE_CURE_IN_LEFT else 0)
+    total = rec["processed"] + remaining
+    return remaining / total if total > 0 else 0.0
+
+
+def fetch_unprocessed(ctx):
+    """Load the SOS page in a browser context, parse the table, fill UBS_DATA, return the tab's rows."""
+    page = ctx.new_page()
+    try:
+        page.goto(UBS_URL, wait_until="networkidle", timeout=60000)
+        try:
+            page.wait_for_selector("table tbody tr", timeout=30000)
+        except Exception:
+            pass  # parse whatever did render; parse_ubs_html explains if it is unusable
+        html = page.content()
+    finally:
+        page.close()
+    by_county = parse_ubs_html(html)
+    UBS_DATA.clear()
+    UBS_DATA.update(by_county)
+    stamps = sorted(r["last"] for r in by_county.values() if re.match(r"\d{4}-", r["last"]))
+    SOURCE_NOTES["RAW_Unprocessed"] = f"{len(by_county)} counties" + (f"; reports from {stamps[0]} to {stamps[-1]}" if stamps else "")
+    rows = [["County", "Processed", "Remaining", "To Cure", "Est. % Left", "Last Report", "Next Results", "Updated"]]
+    for key in sorted(by_county):
+        r = by_county[key]
+        rows.append([r["county"], r["processed"], r["remaining"], r["cure"], f"{left_fraction(r) * 100:.2f}%", r["last"], r["next"], NOW])
+    return rows
+
+
+def counties_for_tab(tab: str):
+    if tab in SOURCE_COUNTIES:
+        return SOURCE_COUNTIES[tab]
+    return ["Alameda"] if tab.startswith("RCV_") else None
+
+
+def weighted_left(votes_by_county: dict, ubs: dict):
+    """Left-to-count share for a race spread over several counties.
+    County c has counted V_c votes in the race and has left-fraction r_c, so it will end up with V_c / (1 - r_c) votes,
+    of which V_c * r_c / (1 - r_c) are still to come. Add those up across the counties. None if no county is known."""
+    num = den = 0.0
+    for county, v in votes_by_county.items():
+        rec = ubs.get(county.lower())
+        if not rec or not v:
+            continue
+        r = left_fraction(rec)
+        if r >= 1:
+            continue
+        num += v * r / (1 - r)
+        den += v / (1 - r)
+    return num / den if den else None
+
+
+def add_left_columns(tabs: dict, ubs: dict):
+    """Append "Est. % Left" (and "Source Updated" when the tab has no timestamp of its own) to every tab we can place.
+    Only columns are APPENDED on the right, so every existing cell address stays where it was."""
+    for tab, rows in tabs.items():
+        header = rows[0]
+        if "Est. % Left" in header:
+            continue
+        if tab == "RAW_Statewide":
+            ci = header.index("Contest")
+            cache = {}
+            header.append("Est. % Left")
+            for row in rows[1:]:
+                c = row[ci]
+                if c not in cache:
+                    v = weighted_left(SOS_COUNTY_VOTES.get(c, {}), ubs)
+                    cache[c] = "" if v is None else f"{v * 100:.2f}%"
+                row.append(cache[c])
+            continue
+        counties = counties_for_tab(tab)
+        recs = [ubs[c.lower()] for c in (counties or []) if c.lower() in ubs]
+        if not recs:
+            continue
+        weight = sum(r["processed"] + r["remaining"] for r in recs) or 1
+        frac = sum(left_fraction(r) * (r["processed"] + r["remaining"]) for r in recs) / weight
+        stamps = [r["last"] for r in recs if re.match(r"\d{4}-", r["last"])]
+        add_time = not any(h in header for h in ("Source Updated", "SOS As Of", "Report Time"))
+        # A tab that has a "Source Updated" column but could not fill it (e.g. its XML feed was unavailable) borrows the
+        # county's "last reported" time instead.
+        if not add_time and "Source Updated" in header and stamps:
+            si = header.index("Source Updated")
+            if not any(row[si] for row in rows[1:]):
+                for row in rows[1:]:
+                    row[si] = max(stamps)
+        header.append("Est. % Left")
+        if add_time:
+            header.append("Source Updated")
+        for row in rows[1:]:
+            row.append(f"{frac * 100:.2f}%")
+            if add_time:
+                row.append(max(stamps) if stamps else "")
+
+
+# =====================================================================================
 # RUNNER
 # =====================================================================================
 
@@ -903,6 +1192,7 @@ def run_source(tabs, status, tab_name, fetcher, note=""):
     `status` is a dict keyed by tab name, so a second attempt for the same tab simply replaces the first."""
     try:
         rows = fetcher()
+        note = note or SOURCE_NOTES.pop(tab_name, "")
         n = len(rows) - 1
         if n <= 0:
             print(f"[EMPTY] {tab_name}: parsed 0 rows - leaving the tab's previous data alone")
@@ -925,13 +1215,12 @@ def main():
         "RAW_Alameda": fetch_alameda_main,
         "RAW_LA": fetch_la,
         "RAW_SF": fetch_sf,
-        "RAW_SanDiego": lambda: fetch_lvt_multipage("https://www.livevoterturnout.com/ENR/sandiegocaenr/25/en/Index_25.html"),
         "RAW_Statewide": fetch_statewide,
     }
     for tab, (county, election_id) in CLARITY_SOURCES.items():
         sources[tab] = lambda c=county, e=election_id: fetch_clarity(c, e)          # plain request first
     for tab, url in LVT_CLEAN_SOURCES.items():
-        sources[tab] = lambda u=url: fetch_lvt_clean(u)
+        sources[tab] = lambda u=url, t=tab: fetch_lvt_clean(u, t)
     for tab, url in LVT_XML_SOURCES.items():
         sources[tab] = lambda u=url: fetch_lvt_xml(u)
     for tab, race in RCV_ALAMEDA.items():
@@ -946,31 +1235,42 @@ def main():
         print(f"[INFO] RCV discovery skipped: {e}")
 
     # ---- Stage 2: things that need a real browser ---------------------------------------------------------
-    #   (a) Clarity counties that were refused in stage 1  (b) Sacramento, which is a JavaScript page.
+    #   (a) Clarity counties that were refused in stage 1   (b) the Secretary of State's "ballots left" page
+    #   (c) Sacramento, which is a JavaScript page.
     clarity_blocked = [t for t in CLARITY_SOURCES if t not in tabs]
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()  # Sacramento's page - set up exactly as before
+            ctx = browser.new_context(user_agent=HEADERS["User-Agent"], locale="en-US")  # a normal-looking browser for the rest
 
-            if clarity_blocked:
-                ctx = browser.new_context(user_agent=HEADERS["User-Agent"], locale="en-US")
-                for tab in clarity_blocked:
-                    county, election_id = CLARITY_SOURCES[tab]
-                    plain_error = status[tab][3]
-                    getter = BrowserGetter(ctx, f"{CLARITY_ROOT}/{county}/{election_id}/")
-                    run_source(tabs, status, tab, lambda c=county, e=election_id, g=getter: fetch_clarity(c, e, g),
-                               note="fetched through the browser (a plain request was refused)")
-                    getter.close()
-                    if tab not in tabs:  # still failing: keep both explanations
-                        status[tab][3] = f"plain: {plain_error} || browser: {status[tab][3]}"[:300]
+            for tab in clarity_blocked:  # (a)
+                county, election_id = CLARITY_SOURCES[tab]
+                plain_error = status[tab][3]
+                getter = BrowserGetter(ctx, f"{CLARITY_ROOT}/{county}/{election_id}/")
+                run_source(tabs, status, tab, lambda c=county, e=election_id, g=getter: fetch_clarity(c, e, g),
+                           note="fetched through the browser (a plain request was refused)")
+                getter.close()
+                if tab not in tabs:  # still failing: keep both explanations
+                    status[tab][3] = f"plain: {plain_error} || browser: {status[tab][3]}"[:300]
 
-            run_source(tabs, status, "RAW_Sacramento", lambda: fetch_sacramento_web(page))
+            run_source(tabs, status, "RAW_Unprocessed", lambda: fetch_unprocessed(ctx))  # (b)
+            run_source(tabs, status, "RAW_Sacramento", lambda: fetch_sacramento_web(page))  # (c)
             browser.close()
     except Exception as e:
         print(f"[ERROR] browser stage failed: {e}")
-        if "RAW_Sacramento" not in status:
-            status["RAW_Sacramento"] = ["RAW_Sacramento", "ERROR (previous data kept)", "", str(e)[:300], NOW_PT]
+        for t in ("RAW_Unprocessed", "RAW_Sacramento"):
+            if t not in status:
+                status[t] = [t, "ERROR (previous data kept)", "", str(e)[:300], NOW_PT]
+
+    # Attach "Est. % Left" and the county's "last reported" time to every tab we can place (see section 8).
+    # If the ballots-left page could not be read, the tabs simply go without those columns this run.
+    try:
+        if UBS_DATA:
+            add_left_columns(tabs, UBS_DATA)
+    except Exception as e:
+        print(f"[ERROR] adding the ballots-left columns failed: {e}")
+        status["RAW_Unprocessed"] = ["RAW_Unprocessed", "ERROR (columns not added)", "", str(e)[:300], NOW_PT]
 
     # ---- Stage 3: send everything to Google Sheets --------------------------------------------------------
     # STATUS tab: one row per source, so you can see at a glance which tabs are stale and why.
